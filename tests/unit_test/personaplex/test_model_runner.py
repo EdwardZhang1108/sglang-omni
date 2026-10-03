@@ -253,7 +253,7 @@ def test_seeded_audio_sampler_draws_reproducibly_from_one_generator():
     assert "audio_generator" not in unseeded.data.talker_model_inputs
 
 
-def test_resume_after_a_retract_replays_the_generated_positions():
+def test_resume_after_a_retract_replays_the_generated_positions() -> None:
     model = FakeModel()
     runner = make_runner(model)
     request = make_request(5)
@@ -282,17 +282,23 @@ def test_resume_after_a_retract_replays_the_generated_positions():
     frames_before = len(data.talker_model_inputs["frames"])
     assert len(agent_rows) == len(generated)
 
+    fresh = make_request(2, request_id="fresh")
+    fresh_timeline = fresh.data.talker_model_inputs["timeline"]
+    replayed = prompt + len(generated)
     forward_batch = SimpleNamespace(
-        replace_embeds=None, input_ids=torch.zeros(prompt + len(generated))
+        replace_embeds=None,
+        input_ids=torch.zeros(replayed + fresh_timeline.num_prompt_positions),
     )
     runner.before_prefill(
         forward_batch,
-        SimpleNamespace(reqs=[SimpleNamespace(output_ids=generated)]),
-        [request],
+        SimpleNamespace(
+            reqs=[SimpleNamespace(output_ids=generated), SimpleNamespace(output_ids=[])]
+        ),
+        [request, fresh],
     )
 
     embeds = get_omni_prefill_inputs(forward_batch).input_embeds
-    assert embeds.shape[0] == prompt + len(generated)
+    assert embeds.shape[0] == replayed + fresh_timeline.num_prompt_positions
     assert torch.equal(embeds[:prompt], timeline.prefill_tokens.float())
     for index, token in enumerate(generated):
         row = embeds[prompt + index].long()
@@ -303,13 +309,22 @@ def test_resume_after_a_retract_replays_the_generated_positions():
         assert torch.equal(row[USER_STREAM_OFFSET:], timeline.user_rows[prompt + index])
 
     runner.post_prefill(
-        SimpleNamespace(next_token_ids=torch.tensor([80])), None, None, [request]
+        SimpleNamespace(next_token_ids=torch.tensor([80, 90])),
+        None,
+        None,
+        [request, fresh],
     )
     resumed = model.depformer.calls[-1]
-    assert (resumed.forced == -1).all()
+    assert resumed.text.tolist() == [80, 90]
+    assert (resumed.forced[0] == -1).all()
+    assert torch.equal(resumed.forced[1], fresh_timeline.forced_agent_at_start)
     frames = data.talker_model_inputs["frames"]
     assert len(frames) == frames_before + 1
     assert torch.equal(frames[-1], output_frame(agent_rows[-1], resumed.codes[0]))
+    assert torch.equal(
+        fresh.data.talker_model_inputs["frames"][0],
+        output_frame(fresh_timeline.agent_row_before_start, resumed.codes[1]),
+    )
 
     data.output_ids = generated + [80]
     state = PersonaPlexState.from_dict(apply_lm_result(data).data)
