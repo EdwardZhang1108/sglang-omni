@@ -132,16 +132,17 @@ class PersonaPlexModelRunner(ModelRunner):
             request: SchedulerRequest,
         ) -> tuple[AudioSampling, str | None]:
             sampling = request.data.talker_model_inputs["sampling"]
-            # Note (kalebkwok): A seeded request draws from its own generator, so it
-            # never shares a pass.
+            # Note (Jinjie Guo): A seeded request uses its own random generator, so it
+            # always gets a pass of its own.
             if sampling.audio_seed is None:
                 return sampling.audio, None
             else:
                 return sampling.audio, request.request_id
 
         start = 0
-        # Note (kalebkwok): Only neighbours merge, so each pass reads row slices and
-        # needs no index tensor copied to the device.
+        # Note (Jinjie Guo): A pass takes only requests that are next to each other.
+        # Then each pass can use a slice of rows, and no index tensor goes to the
+        # device.
         for _, group in groupby(requests, key=depformer_pass_key):
             pass_requests = list(group)
             end = start + len(pass_requests)
