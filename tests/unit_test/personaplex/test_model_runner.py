@@ -180,18 +180,18 @@ def test_decode_rows_chain_text_agent_codes_and_caller_frames():
 def test_compatible_neighbours_share_one_depformer_pass() -> None:
     model = FakeModel(max_batch=5)
     runner = make_runner(model)
-    seeded = {"seed": 7}
+    seeded_params = {"seed": 7}
     requests = [
         make_request(2, request_id="plain-0"),
         make_request(2, request_id="plain-1"),
         make_request(2, request_id="greedy", params={"audio_temperature": 0.0}),
-        make_request(2, request_id="seeded-0", params=seeded),
-        make_request(2, request_id="seeded-1", params=seeded),
+        make_request(2, request_id="seeded-0", params=seeded_params),
+        make_request(2, request_id="seeded-1", params=seeded_params),
     ]
     timelines = [request.data.talker_model_inputs["timeline"] for request in requests]
-    prompt = sum(timeline.num_prompt_positions for timeline in timelines)
+    prompt_positions = sum(timeline.num_prompt_positions for timeline in timelines)
     runner.before_prefill(
-        SimpleNamespace(replace_embeds=None, input_ids=torch.zeros(prompt)),
+        SimpleNamespace(replace_embeds=None, input_ids=torch.zeros(prompt_positions)),
         SimpleNamespace(reqs=[SimpleNamespace(output_ids=[]) for _ in requests]),
         requests,
     )
@@ -259,10 +259,10 @@ def test_resume_after_a_retract_replays_the_generated_positions() -> None:
     request = make_request(5)
     data = request.data
     timeline = data.talker_model_inputs["timeline"]
-    prompt = timeline.num_prompt_positions
+    prompt_positions = timeline.num_prompt_positions
 
     runner.before_prefill(
-        SimpleNamespace(replace_embeds=None, input_ids=torch.zeros(prompt)),
+        SimpleNamespace(replace_embeds=None, input_ids=torch.zeros(prompt_positions)),
         SimpleNamespace(reqs=[SimpleNamespace(output_ids=[])]),
         [request],
     )
@@ -284,10 +284,10 @@ def test_resume_after_a_retract_replays_the_generated_positions() -> None:
 
     fresh = make_request(2, request_id="fresh")
     fresh_timeline = fresh.data.talker_model_inputs["timeline"]
-    replayed = prompt + len(generated)
+    replayed_positions = prompt_positions + len(generated)
     forward_batch = SimpleNamespace(
         replace_embeds=None,
-        input_ids=torch.zeros(replayed + fresh_timeline.num_prompt_positions),
+        input_ids=torch.zeros(replayed_positions + fresh_timeline.num_prompt_positions),
     )
     runner.before_prefill(
         forward_batch,
@@ -298,15 +298,17 @@ def test_resume_after_a_retract_replays_the_generated_positions() -> None:
     )
 
     embeds = get_omni_prefill_inputs(forward_batch).input_embeds
-    assert embeds.shape[0] == replayed + fresh_timeline.num_prompt_positions
-    assert torch.equal(embeds[:prompt], timeline.prefill_tokens.float())
+    assert embeds.shape[0] == replayed_positions + fresh_timeline.num_prompt_positions
+    assert torch.equal(embeds[:prompt_positions], timeline.prefill_tokens.float())
     for index, token in enumerate(generated):
-        row = embeds[prompt + index].long()
+        row = embeds[prompt_positions + index].long()
         assert row[0].item() == token
         assert torch.equal(
             row[AGENT_STREAM_OFFSET:USER_STREAM_OFFSET], agent_rows[index]
         )
-        assert torch.equal(row[USER_STREAM_OFFSET:], timeline.user_rows[prompt + index])
+        assert torch.equal(
+            row[USER_STREAM_OFFSET:], timeline.user_rows[prompt_positions + index]
+        )
 
     runner.post_prefill(
         SimpleNamespace(next_token_ids=torch.tensor([80, 90])),

@@ -139,17 +139,15 @@ class PersonaPlexModelRunner(ModelRunner):
             else:
                 return sampling.audio, request.request_id
 
-        start = 0
-        # Note (Jinjie Guo): A pass takes only requests that are next to each other.
-        # Then each pass can use a slice of rows, and no index tensor goes to the
-        # device.
+        start_row = 0
+        # Note (Jinjie Guo): A pass takes only adjacent requests, so it needs no gather.
         for _, group in groupby(requests, key=depformer_pass_key):
             pass_requests = list(group)
-            end = start + len(pass_requests)
+            end_row = start_row + len(pass_requests)
             codes_BK = self.model.depformer.generate(
-                text_token_B[start:end],
-                self.model.hidden_out[start:end],
-                forced_BK[start:end],
+                text_token_B[start_row:end_row],
+                self.model.hidden_out[start_row:end_row],
+                forced_BK[start_row:end_row],
                 self.audio_sampler(pass_requests[0].data),
             )
             for request, codes in zip(pass_requests, codes_BK, strict=True):
@@ -161,7 +159,7 @@ class PersonaPlexModelRunner(ModelRunner):
                 inputs["agent_rows"].append(codes)
                 inputs["frames"].append(frame)
                 inputs["pending_frames"].append(frame)
-            start = end
+            start_row = end_row
 
     def free_codes(self) -> torch.Tensor:
         return torch.full(
