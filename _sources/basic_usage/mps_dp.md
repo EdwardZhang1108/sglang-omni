@@ -8,6 +8,107 @@ Same-GPU data parallelism runs several complete serving replicas on one GPU and 
 
 ![Multiple host chains plus CUDA MPS filling the idle GPU](../_static/image/same-gpu-dp-mps.svg)
 
+## Native runtime support (`--mps`)
+
+The runtime can manage MPS itself for the processes of **one pipeline**. When a
+pipeline colocates two or more single-GPU stage processes on one GPU (for
+example a frontend process next to the generation process, or process-level
+replicas), pass `--mps auto`:
+
+```bash
+sgl-omni serve --model-path <model> --mps auto
+```
+
+Modes (`--mps` on the CLI or `mps:` in the pipeline config; default `off`):
+
+* `off`: MPS is never touched.
+* `auto`: MPS is enabled on every GPU that hosts two or more single-GPU,
+  non-TP CUDA processes of this pipeline. GPUs with one process and TP groups
+  run without MPS.
+* `on`: a single eligible process is enough, and an MPS-incapable platform is
+  a hard error instead of a warning. Use `on` for same-GPU data parallelism:
+  every `serve --mps on` on one GPU joins the same daemon.
+
+Both `auto` and `on` reject startup before acquiring MPS state when one process's
+resolved placement spans more than one physical GPU; use `mps=off` for that
+placement. Factory CUDA devices use the narrowed worker's local namespace:
+`cuda:0` is compatible with any single-GPU placement, while a nonzero `cuda:N`
+is excluded because narrowing a worker to one UUID makes its only valid CUDA
+ordinal `cuda:0`.
+Pipeline-edge transport remains the responsibility of the existing router and
+relay layers; it does not participate in MPS eligibility.
+
+The daemon is shared per physical GPU (keyed by device UUID): MPS merges
+kernels only for clients of one server, so the first serve creates the
+daemon, later serves join it, and the last one to leave drains the clients
+and quits it. Logical GPU ordinals are resolved once against the parent
+process's CUDA visibility and then grouped by physical UUID; `auto` counts the
+combined client processes in each physical group. Pipeline or stage
+environment defaults must not override `CUDA_VISIBLE_DEVICES` or
+`CUDA_DEVICE_ORDER` while native MPS is enabled; set them on the parent command
+instead, or use `mps=off`. Same-GPU DP is therefore just N serve commands:
+
+```bash
+sgl-omni serve --model-path <model> --mps on --mem-fraction-static 0.35 --port 8807
+sgl-omni serve --model-path <model> --mps on --mem-fraction-static 0.35 --port 8808
+```
+
+Start replicas one after another and give each an explicit memory budget
+(`--mem-fraction-static` or the stage-qualified
+`--<engine-stage>.engine.max_total_tokens`), for the same KV-sizing
+reasons described under the script recipe below. Route traffic with the
+[Omni Router](omni_router.md).
+
+Process-level replicas can size their pools in bytes instead, with
+`engine.kv_cache_bytes` per stage and `total_reserve_bytes` for the replica's
+full footprint. The budgets are then checked against the card before any
+replica is spawned: colocation requires a declared footprint, the summed
+reserves and fractions must fit the card, and the summed KV pools alone must
+too. `engine.kv_cache_bytes` and `engine.max_total_tokens` are mutually
+exclusive on one stage, since the lower token cap would silently shrink the
+byte-derived pool.
+
+The runtime owns the full lifecycle. Every managed process is verified against
+the daemon's client list before serving starts, because a process that misses
+the pipe directory silently falls back to time slicing. A watchdog fails the
+pipeline if daemon identity or control access is lost mid-serving. Shutdown
+re-evaluates the current client list, drains this serve's clients, and quits the
+daemon only when no other serve still owns it.
+
+If a managed worker does not exit before the shutdown timeout, the runtime
+terminates that directly owned child process and reaps it before the launcher
+exits, even when that directly owned worker is also an MPS client. It sends no
+additional signal based on an MPS snapshot or client PID, and never
+automatically signals the daemon, an unknown descendant, or a GPU-wide process
+set. Process ownership and shared MPS state are handled independently: if
+daemon identity, client ownership, or control state cannot be proved after the
+workers are gone, the owner file is marked `retained`, its lock is released,
+and the state directory is preserved. The current command then exits with a
+detailed non-zero error instead of keeping a CLI owner alive.
+
+Dirty state is never repaired automatically. A join requires the native
+`nvidia-cuda-mps-control.pid` identity, a responsive control socket, and every
+published owner lease to still be held. After a hard kill (SIGKILL, OOM kill,
+node crash), even an idle daemon or one dead co-owner makes the next start
+preserve the state and fail with owner/client details and safe cleanup guidance.
+An unlocked or retained owner blocks every later start until an operator has
+inspected and cleaned the state. Existing healthy co-owners keep serving, but
+new owners cannot join and no process retries cleanup automatically. Clean up
+and start again. A normal shutdown leaves nothing behind.
+
+Operator notes: state lives under `/tmp/sglang-omni-mps-<user>/<gpu-uuid>/`
+(`SGLANG_OMNI_MPS_STATE_ROOT` overrides it). Serves that are meant to share
+one GPU must use the same state root, or they cannot discover each other's
+daemon and will run separate MPS servers that time-slice against each other.
+The state root is created with mode `0700`; an existing root must already be a
+non-symlink directory owned by the current user with that mode. Native MPS
+rejects `CUDA_MPS_PIPE_DIRECTORY` in the parent, pipeline, or stage environment
+instead of overwriting or joining an external daemon. It likewise rejects
+`SGLANG_OMNI_WEIGHT_SHARE` in those locations: inside one pipeline, CUDA IPC
+weight sharing is requested with `--weight-share on` and the runtime assigns
+replica roles itself, while the `examples/mps_dp/launch.sh` recipe below sets
+that variable for its own separate serve processes.
+
 ## Deploy
 
 The steps below are one continuous flow. We provide `examples/mps_dp/launch.sh` to manage the private MPS daemon and serving replicas for one run. It records replica processes, ports, and logs, starts replicas sequentially, verifies their KV capacity and MPS attachment, and tears down only the run it recorded. Detailed instructions are as follows:
@@ -45,7 +146,12 @@ Identical `--mem-fraction-static` flags do **not** mean identical KV capacity. `
 
 ![What same-GPU DP spends in VRAM and what it reclaims](../_static/image/same-gpu-dp-vram.svg)
 
-Memory profiling does not coordinate KV allocation across independent replica processes. For `N > 1`, the launcher therefore requires one common `max_total_tokens` value, either from the pipeline config or from `MAX_TOTAL_TOKENS`. SGLang treats this value as an upper bound; the launcher rejects startup unless every replica resolves exactly that capacity. The cap applies independently to each replica; it is not divided across the pool. It is also independent of the request-level `max_new_tokens` limit and does not distribute requests between replicas.
+Memory profiling does not coordinate KV allocation across independent replica processes. For `N > 1`, every replica must resolve the same KV capacity, which can come from either sizing knob but never both:
+
+* `engine.kv_cache_bytes` in the pipeline config sizes every replica's pool deterministically; the launcher verifies all replicas resolved the same capacity and rejects a simultaneous `MAX_TOTAL_TOKENS`, since a lower token cap would silently shrink the byte-derived pool.
+* Without a byte budget, the launcher requires one common `max_total_tokens` value, from the pipeline config or from `MAX_TOTAL_TOKENS`, and rejects startup unless every replica resolves exactly that capacity.
+
+Either cap applies independently to each replica; it is not divided across the pool. It is also independent of the request-level `max_new_tokens` limit and does not distribute requests between replicas.
 
 The H100 Higgs DP3 profile uses `100000` tokens per replica. The H200 Higgs DP8 profile uses `30000` tokens per replica, preserving GPU memory headroom for non-KV runtime allocations, including the colocated audio encoder and vocoder. These values are specific to their configurations, not universal hardware defaults. Recalculate the cap after changing the model, GPU, runtime, replica count, memory settings, or CUDA-graph settings. If a replica cannot allocate the common cap, lower it or reduce the replica count.
 
@@ -61,7 +167,7 @@ MPS should be verified carefully. Four things are easy to conflate: environment 
 
 5. **Route traffic.**
 
-For easy deployment, you can register each replica endpoint with the [Omni Router](omni_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. The case study did not benchmark router scheduling policies, so confirm that the selected policy keeps every replica driven and meets your workload's latency and throughput requirements.
+For easy deployment, you can register each replica endpoint with the [Python Router](python_router.md). Keep the router's `--max-connections` at least as large as the total offered concurrency. The case study did not benchmark router scheduling policies, so confirm that the selected policy keeps every replica driven and meets your workload's latency and throughput requirements.
 
 6. **Tear down safely.**
 
@@ -84,6 +190,63 @@ Setting up and tearing down MPS is more involved than running a single replica, 
 
 The throughput results in the table and H100 case study are from an 80 GB H100 with Higgs. The H200 DP8 profile was validated separately on the full SeedTTS English dataset at concurrency 64 per replica. Re-evaluate replica count, CPU allocation, token capacity, and saturation concurrency before applying either profile to different hardware or workloads.
 
+
+## Shared weights across replicas (opt-in, default off)
+
+By default every replica loads its own full copy of the AR backbone (7.60 GiB for Higgs 3-4B — about a third of a DP3 footprint). Since all replicas run the same read-only weights on the same GPU, the launcher can instead share **one** copy over CUDA IPC:
+
+> If your replicas live inside one pipeline (`processes.<name>.num_replicas` with a repeated `replica_devices` entry), prefer `sgl-omni serve --weight-share on`: the runtime assigns leader and follower roles, orders startup and shutdown around them, and needs no environment variable. See [Process Topology, Replicas, and GPU Sharing](process_topology.md). The `WEIGHT_SHARE=1` recipe below covers the other shape, several independent `serve` processes supervised by the script; the architecture support table applies to both.
+
+**Scope and contract.** This is opt-in (`WEIGHT_SHARE=1`, default off) and gated to **validated architectures with tp=pp=1**; anything else is rejected before any resource is created, because a model that writes per-request state into a shared parameter would corrupt co-located replicas. An architecture audit alone does not enable sharing: a model is supported only after the documented launcher command passed end-to-end validation (shared N=2 boot under MPS, health, attach verification, concurrent-request correctness, clean teardown) at the current revision. `WEIGHT_SHARE=1` requires `CONFIG`, so the supported-config check runs in preflight, before the MPS daemon, state directory, or any replica exists. Each supported architecture carries a share policy: registered tensors the model writes at serving time (per-step decode staging scratch) are classified **replica-private** — every replica keeps its own storage for them and only the immutable weights alias one storage. Leader and follower derive the classification from the same policy and fail closed on any disagreement (it is part of the manifest). Sharing is a whole-group lifecycle: the leader must outlive followers, restart the whole run together (never a single replica), online weight updates are refused while sharing is active, and each follower requires an explicit `MAX_TOTAL_TOKENS` (its dummy weights are freed before KV profiling, so KV sizing must be pinned). `autodp.sh` sizes a **maximum *estimated*** DP (boot-validated), not an absolute safe maximum; because its sizing assumes sharing, it defaults `WEIGHT_SHARE=1`, while `launch.sh` itself defaults off.
+
+A model is either **supported** or **not supported**; there is no intermediate tier. Supported means all of the following passed at the current revision, with commands and logs recorded in the PR: the documented `launch.sh` command boots `N=2` with `WEIGHT_SHARE=1` under a private MPS daemon, every replica passes its health check and MPS attach verification, the follower attaches the leader's weights over CUDA IPC and holds no second resident copy of the shared weights after boot, concurrent requests across replicas return correct outputs (byte-identical audio to the single-replica baseline for TTS; word-identical transcripts for ASR, where timestamp fields may jitter under batching), and teardown leaves no replica process or MPS client behind. This is one-H100 end-to-end smoke validation — executable support evidence at the current revision, not a long-term stability or CI claim.
+
+| Architecture | Status | Config | Replica-private | Shared weight mass |
+|---|---|---|---|---|
+| MOSS TTS delay (`MossTTSDelaySGLangModel`) | Supported | `moss_delay_h100_dp2.yaml` | `_decode_input_embedding.weight` (per-step decode staging) | Qwen3-8B backbone, embeddings, heads (17.05 GiB) |
+| Higgs TTS (`HiggsMultimodalQwen3ForConditionalGeneration`) | Supported | `higgs_h100_dp3.yaml` | none identified | all registered parameters/buffers (7.55 GiB) |
+| MOSS TTS local (`MossTTSLocalSGLangModel`) | Supported | `moss_local_h100_dp2.yaml` | `_decode_input_embedding.weight` (per-step decode staging) | AR backbone, embeddings, local transformer, rope buffers (8.44 GiB) |
+| Whisper (`WhisperForConditionalGeneration`) | Supported | `whisper_h100_dp2.yaml` | none identified | all registered tensors (1.51 GiB) |
+| MOSS Transcribe-Diarize (`MossTranscribeDiarizeForConditionalGeneration`) | Supported | `moss_td_h100_dp2.yaml` | none identified | all registered tensors (1.75 GiB) |
+| Qwen3-ASR (`Qwen3ASRForConditionalGeneration`) | Supported | `qwen3_asr_h100_dp2.yaml` | none identified | all registered tensors (3.83 GiB) |
+| FunASR Nano (`FunAsrNanoForConditionalGeneration`) | Supported | `fun_asr_h100_dp2.yaml` | none identified | all registered tensors (1.57 GiB) |
+
+Validation update for #1401 Part 1: at code revision [`5e7a8c7`](https://github.com/sgl-project/sglang-omni/pull/1557/commits/5e7a8c717b9ec85b1f72aa7d3444f9f5ff7ec72e), MOSS TTS local and MOSS TTS delay passed `N=2`, `WEIGHT_SHARE=1` health, MPS attachment, leader/follower byte-identity, request completion, and clean teardown on H200. Other Supported rows were not revalidated.
+
+Each supported model launches with its config from `examples/mps_dp/configs/` and the same command shape, for example:
+
+```bash
+CONFIG=examples/mps_dp/configs/moss_delay_h100_dp2.yaml N=2 WEIGHT_SHARE=1 CORE_BLOCKS="0-7 8-15" bash examples/mps_dp/launch.sh up
+```
+
+Everything else is **not supported** and is rejected in preflight, before the MPS daemon, state directory, handle file, or any replica process exists. For these, a completed architecture audit is recorded where one exists, but support is still in progress:
+
+* Ming TTS (`MingTTSSGLangModel`): audit complete; blocked on VRAM (the 16.8B leader alone reaches the 80 GB card edge), pending an H200 pass.
+* Voxtral TTS (`VoxtralSGLangTTSModel`), Fish S2-Pro (`S2ProSGLangTextModel`): audit complete; shared boots were observed in exploratory runs, but concurrent-request correctness needs each model's own client, which this validation does not have yet.
+* Qwen3-TTS (`Qwen3TTSTalker`): audit complete. At code revision [`cd45a47`](https://github.com/sgl-project/sglang-omni/commit/cd45a47a1838017c89fb2178f167aac0cd7412a3), deterministic inference passed the `N=2`, `WEIGHT_SHARE=1` concurrent byte-identity qualification on H200 with a 30,000-token cap. It remains not supported because that result requires `enable_deterministic_inference: true`, which serializes preprocessing and vocoder decoding and disables Talker compilation and the initial vocoder CUDA graph, materially reducing throughput. Default-mode inference has not passed the byte-identity contract, so the launcher continues to reject weight sharing for this pipeline.
+* LLaDA2 (`LLaDA2MoeModelLM`): audit complete; its pipeline declares no generation SGLang stage, so the launcher cannot drive it at any `N`.
+* Qwen3-Omni (`Qwen3OmniThinkerForCausalLM`, `Qwen3OmniTalker`): audit of both engines complete; the speech pipeline runs two SGLang engines and the text pipeline declares no generation stage, so the launcher cannot drive either.
+* Ming-Omni thinker (`BailingMoeV2ForCausalLM`) and every other architecture: no completed audit; adding one requires a post-load mutation audit, a policy entry, and the full launcher validation above.
+
+For MOSS, sharing covers the SGLang AR engine only: the preprocessing and vocoder codec instances keep loading per replica by design (they hold streaming state), so they are outside both the share and its memory savings.
+
+The measurements below are performance context from this PR's validation campaign (one 80 GB H100, post-boot VRAM, one measurement pass per cell unless noted); the support decision above rests on the current-revision end-to-end runs, not on these cells. Only supported models are shown.
+
+| Model | Validated DP, IPC off | Validated DP, IPC on | VRAM, off | VRAM, on | Saved per follower | Throughput (aggregate across replicas), off vs on |
+|---|---|---|---:|---:|---:|---|
+| MOSS TTS delay | **DP1** (unshared DP2: replica 1 cannot fit its own weight copy in the remaining budget) | **DP2** | n/a | 42.4 GB | 17.05 GiB | single 5.7 to shared DP2 agg 7.5 qps (+32%, per replica 3.8, single run); aligned-history outputs byte-identical; leader and follower processes 29.9 and 12.4 GB |
+| Higgs TTS 3-4B | DP3 (100k cap; unshared DP4 needs 98 GB) | **DP4** (74.9 GB idle, 78.4 under load) | 73.7 GB at DP3 | 58.1 GB at DP3 | 7.55 GiB | shared DP4 beats shared DP3 by +10% to +40% round-matched on this H100 driver; separately, the author's H200 series showed parity at every N |
+| MOSS TTS local | DP3 at the card edge, vocoder graphs partly eager | DP3 with 13.3 GB headroom, full graphs | 78.0 GB | 61.8 GB | 8.44 GiB | measured parity: DP2 agg 17.9 vs 18.2 (per replica 9.0 vs 9.1), DP3 agg 23.4 vs 23.4 (per replica 7.8) qps |
+| Whisper large-v3-turbo | DP3 (40k cap) | **DP6** (19.7 GB) | 14.1 GB at DP3 | 10.7 GB at DP3 | 1.51 GiB | parity at DP3 (agg 67.8 vs 68.0); shared DP6 reaches agg 95.3 cold qps, +40% over DP3 |
+| MOSS Transcribe-Diarize | DP3 (40k cap) | DP3 | 23.9 GB | 20.2 GB | 1.75 GiB | parity: agg 75.7 vs 70.9 cold qps (per replica 25.2 vs 23.6; 192 unique clips) |
+| Qwen3-ASR 1.7B | DP3 (40k cap) | DP3 | 28.2 GB | 20.2 GB | 3.83 GiB | parity: agg 67.5 vs 64.5 (per replica 22.5 vs 21.5) |
+| FunASR Nano | DP2 (30k cap) | DP2 | 11.8 GB | 10.2 GB | 1.57 GiB | parity: agg 40.6 vs 42.5 cold qps (per replica 20.3 vs 21.3) |
+
+The validated-DP columns show the highest configuration each mode booted and served in these runs, not proven ceilings: Whisper kept scaling to DP6 and its knee is still unfound, so treat the small models' DP as CPU-core-limited, not VRAM-limited. For the ASR models the ceiling is host-bound, not VRAM-bound, so sharing does not move it; sharing moves the ceiling exactly where weights bind: MOSS delay (DP1 to DP2) and MOSS local (edge DP3 to operable DP3). Fixed-N parity is the mechanism-level expectation (same kernels over the same weight values either way); the single-run ASR pairs differ by under 7% with no consistent direction and MOSS local's repeated rounds match, but treat single-pass cells as observations pending repetition. The throughput gains come from the extra replicas or KV the freed memory funds (delay DP2 +32% over its single replica, local DP3 +29% over DP2, Higgs DP4 +10% to +40% over DP3).
+
+Correctness scope for the smoke validation: TTS byte-identity holds for a replica serving the seeded sequence as its first traffic, for both leader and follower and with the peer under concurrent load; the MOSS samplers are additionally sensitive to their own serving history, at identical rates with sharing off and on (measured controls), so byte comparisons require aligned histories, and no evidence points at cross-replica sharing pollution. FunASR: 63/63 admissible clips exact; the 64th corpus clip exceeds the model's own 30-second VAD limit and is rejected identically by the baseline and both shared replicas.
+
+VRAM saved per follower is the byte count the leader exports and each follower aliases instead of allocating; the off and on columns differ by roughly (N-1) times this value. ASR throughput used 64 unique synthesized clips per replica with the cold round reported (a warm rerun is cache-inflated). Sharing leaves throughput at parity at a fixed N everywhere it was paired; the wins are fit (MOSS delay DP2, previously impossible), margin (MOSS local DP3: 13.3 GB headroom and full graphs versus 0.33 GB and graph fallback), and follower memory.
 
 ## How We Found This
 
@@ -108,7 +271,16 @@ Serving throughput depends on more than the GPU's peak compute. It also depends 
 
 **Replicating the weights costs VRAM. What does that buy?**
 
-Same-GPU DP does not save VRAM; it spends more of it. It copies the weights per replica and gives each replica its own, smaller KV pool. What it buys is the otherwise idle compute, reclaimed. That trade pays off only when a tuned single replica leaves the GPU idle (so there are idle SMs to fill) and the model is small enough that its weights are a modest slice of the card, so two or three full replicas still fit. On a compute-bound model, or one too large to hold several weight copies, extra replicas buy little.
+Same-GPU DP does not save VRAM; it spends more of it. It copies the weights per replica and gives each replica its own, smaller KV pool. What it buys is the otherwise idle compute, reclaimed. That trade pays off only when a tuned single replica leaves the GPU idle (so there are idle SMs to fill) and the model is small enough that its weights are a modest slice of the card, so two or three full replicas still fit. On a compute-bound model, or one too large to hold several weight copies, extra replicas buy little. (Weight sharing over CUDA IPC relaxes the fit constraint — followers attach the leader's copy instead of loading their own — but not the idle-compute precondition.)
+
+**Why does this pay for TTS models and not for general LLM serving?**
+
+Memory fit is the enabling condition, not the cause. The cause is idle that a single engine cannot reclaim, and TTS-style AR audio models produce it on two axes at once:
+
+- *Latency-capped batch shapes.* Streaming first-chunk latency pins the per-replica batch small, and a 0.6–4B talker at that batch runs low-occupancy kernels. The usual LLM remedy — batch deeper in one engine — spends the latency budget the product is built around.
+- *Host-heavy serving path.* Sampler pools, vocoder scheduling, chunk assembly, and HTTP streaming do per-step host work that rivals the GPU step time, so a single process idles the card temporally between launches. N processes overlap one replica's dispatch bubble with another's kernels; this is also why same-GPU DP scaling is sensitive to the CPU cores allotted per replica.
+
+A large dense transformer inverts every part of this: its decode batch can grow until the GEMMs saturate the SM array (continuous batching in one engine already multiplexes requests over one weight copy), SM utilization is high at serving batch sizes so MPS has no idle to harvest — only contention to add — and at tens of GiB per weight copy, same-card replicas stop fitting at all. The scaling tools there are TP/PP/EP within one engine, not DP behind MPS. Rule of thumb: colocate replicas when a tuned single replica holds roughly ≤60% SM-active under its latency SLO and N× the footprint fits (weight sharing extends the fit); otherwise scale the batch, not the process count.
 
 ## Reproduce the results
 
@@ -149,7 +321,7 @@ One H100 80 GB (driver 580.126.20 / CUDA 13), sglang-omni `a78de4cb`, sglang `0.
 
 The failures: one DP2 benchmark run hit `cudaErrorMpsRpcFailure`, and one DP2 and one DP3 replica failed to start, all coinciding with host-load spikes. One DP3 run completed every request but at 13.3 qps, so it is marked degraded rather than excluded. The core-pinned single stayed within a few percent across all runs, and DP3 was not clearly repeatably better than DP2.
 
-Note: the `--max-total-tokens` option makes per-replica KV sizing more explicit and comparable. It is not a direct fix for `cudaErrorMpsRpcFailure`, and the launch and runtime failure rate has not been re-measured with it in place; the failures in the table reflect the runs as recorded.
+Note: the `MAX_TOTAL_TOKENS` setting makes per-replica KV sizing more explicit and comparable. It is not a direct fix for `cudaErrorMpsRpcFailure`, and the launch and runtime failure rate has not been re-measured with it in place; the failures in the table reflect the runs as recorded.
 
 The #907 profiling, this repeated case study, and the reviewer verification below are three separate measurement series. They ran on different dates and load, and in some cases different software, so they should not be compared by absolute QPS; the differences between roughly 61, 21, and 29.9 qps are not attributed to a single cause.
 
@@ -169,7 +341,7 @@ Low SM activity at the tuned single replica's peak may indicate reclaimable head
 
 1. **Generality is not fully validated.** Beyond the pinned H100 Higgs case study, we also ran related experiments on H200 and used SGLang to serve Qwen3-4B directly; both lines of work largely confirmed the same-GPU DP gains. Space and time limit how completely we can present those results here, and the measurements are not yet as polished as we would like. We believe same-GPU DP is a promising direction for smaller models on GPUs with ample memory and compute headroom, but the experimental coverage is still incomplete.
 
-2. **KV sizing is hardware- and workload-specific.** The launcher enforces equal per-replica KV capacity through a common `--max-total-tokens`. A sizing procedure that generalizes across models, runtimes, and GPU configurations still requires further study.
+2. **KV sizing is hardware- and workload-specific.** The launcher enforces equal per-replica KV capacity through a common `MAX_TOTAL_TOKENS`. A sizing procedure that generalizes across models, runtimes, and GPU configurations still requires further study.
 
 3. **Router and scheduler still need a deeper dive.** Both the router and the SGLang Omni scheduler need further optimization. On the router side, better routing strategies for a colocated pool are clearly required. On the scheduler side, a more ambitious question is whether we can borrow the spirit of LLM prefill–decode (PD) disaggregation: keep one large shared KV cache and let multiple replicas share it. That direction is extremely challenging, and we believe the potential payoff is correspondingly large.
 

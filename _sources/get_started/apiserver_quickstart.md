@@ -43,6 +43,27 @@ The most useful flags are:
 
 If you already have a pipeline config file, you can also pass `--config path/to/config.yaml`. When the config file contains `model_path`, `--model-path` is optional and can be used as an override.
 
+### Unified SGLang CLI
+
+When SGLang-Omni is installed alongside an SGLang release that supports serve
+backend plugins, the same server can be launched through the core executable:
+
+```bash
+sglang serve <model-name-or-path> --model-type omni [additional-arguments]
+```
+
+Config-only launches are supported as well:
+
+```bash
+sglang serve --model-type omni --config path/to/config.yaml
+```
+
+SGLang-Omni intentionally does not install another `sglang` executable. It
+registers an `omni` serve backend with SGLang core, while `sgl-omni serve`
+remains available as a backward-compatible alias. Automatic Omni model
+detection is not enabled yet; select the backend explicitly with
+`--model-type omni`.
+
 ## Check That It Works
 
 ### Health check
@@ -183,8 +204,9 @@ Two things to remember:
 When requests fail, the server returns standard HTTP error codes:
 
 - `400 Bad Request`: malformed request body or invalid parameters
+- `422 Unprocessable Entity`: a request field fails schema validation, such as empty `messages` without top-level `audios`, `images` or `videos`, or `max_tokens` below 1 (the response names the field)
 - `500 Internal Server Error`: runtime error during generation (check server logs for details)
-- `503 Service Unavailable`: the runtime is not healthy (verify with `/health`)
+- `503 Service Unavailable`: the request queue is full (retry later), or the runtime is not healthy (verify with `/health`)
 
 If you see a 500 error, check the server logs for the full traceback. Common issues include:
 - unsupported media formats
