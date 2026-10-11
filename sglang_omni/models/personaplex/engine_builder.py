@@ -94,7 +94,10 @@ class PersonaPlexEngineBuilder(TtsEngineBuilder[SGLangARRequestData]):
 
     def generation_defaults(self, *, dtype: str) -> GenerationDefaults:
         return {
-            "disable_cuda_graph": True,
+            # note (wilsonzheng0327): The decode step reads its row from fusion_buffer
+            # and leaves its hidden state in hidden_out, so SGLang can replay it.
+            # Other platforms keep the eager path they were validated on.
+            "disable_cuda_graph": not current_platform.is_cuda(),
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
             "enable_torch_compile": False,

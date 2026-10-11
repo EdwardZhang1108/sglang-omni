@@ -20,6 +20,7 @@ from sglang_omni.models.personaplex.hf_config import (
     DEFAULT_CONTEXT_LENGTH,
     build_backbone_config,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.cpu import CPUOmniPlatform
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 
@@ -72,12 +73,14 @@ def test_shim_requires_the_lm_weights(tmp_path):
         shim_checkpoint_dir(tmp_path, context_length=4096)
 
 
-def test_generation_defaults_keep_the_runner_assumptions():
+@pytest.mark.parametrize("is_cuda", [True, False])
+def test_generation_defaults_keep_the_runner_assumptions(monkeypatch, is_cuda):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
     defaults = PersonaPlexEngineBuilder().generation_defaults(dtype="bfloat16")
     assert defaults["max_running_requests"] == 1
     assert defaults["chunked_prefill_size"] == -1
     assert defaults["disable_overlap_schedule"] is True
-    assert defaults["disable_cuda_graph"] is True
+    assert defaults["disable_cuda_graph"] is not is_cuda
     assert defaults["sampling_backend"] == "pytorch"
 
 
