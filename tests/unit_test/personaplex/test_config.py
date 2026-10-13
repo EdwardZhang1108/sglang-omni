@@ -77,3 +77,13 @@ def test_personaplex_chunk_ramp_rejects_invalid_user_configuration(
                 ["code2wav"],
             )
             ConfigResolver(config).resolve(patches)
+
+
+def test_async_decode_can_be_disabled_from_cli() -> None:
+    config = PersonaPlexPipelineConfig(model_path="model")
+    assert config.stage_named("lm").factory.enable_async_decode
+    manager = ConfigManager(config)
+    updated = manager.merge_config(
+        manager.parse_extra_args(["--lm.factory.enable_async_decode", "false"])
+    )
+    assert not updated.stage_named("lm").factory.enable_async_decode

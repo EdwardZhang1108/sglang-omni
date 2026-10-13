@@ -36,6 +36,14 @@ Five stages run under `MultiProcessPipelineRunner` (preprocessing, Mimi encode, 
 
 For Intel GPUs, follow the [PersonaPlex XPU recipe](../get_started/installation_xpu.md#personaplex-speech-to-speech-single-xpu).
 
+On CUDA, the LM keeps decode feedback on the GPU and launches the next decode
+before collecting the previous result. This overlaps host scheduling with GPU
+work, but can defer delivery of a frame by one decode interval. Set
+`--lm.factory.enable_async_decode false` to use synchronous decode. Other
+platforms, requests needing host token history for sampling, and requests
+returning log probabilities use the synchronous path. Lookahead also stops at
+the caller-frame budget or when the next caller row is unavailable.
+
 ## Serving over HTTP
 
 ```bash

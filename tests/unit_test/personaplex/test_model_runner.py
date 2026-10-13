@@ -3,15 +3,20 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from sglang_omni.model_runner.base import PendingStep
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.personaplex.architecture import (
     AGENT_STREAM_OFFSET,
     NUM_STREAMS,
     USER_STREAM_OFFSET,
 )
-from sglang_omni.models.personaplex.model_runner import PersonaPlexModelRunner
+from sglang_omni.models.personaplex.model_runner import (
+    PersonaPlexFrameBatch,
+    PersonaPlexModelRunner,
+)
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.models.personaplex.request_builders import (
     apply_lm_result,
@@ -21,6 +26,8 @@ from sglang_omni.models.personaplex.sampling import sample_token
 from sglang_omni.models.personaplex.timeline import output_frame
 from sglang_omni.proto import StagePayload
 from sglang_omni.proto.request import OmniRequest
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.scheduling.types import SchedulerOutput
 
 VOICE_FRAMES = 4
 
@@ -65,6 +72,8 @@ class FakeModel:
 def make_runner(model: FakeModel) -> PersonaPlexModelRunner:
     runner = PersonaPlexModelRunner.__new__(PersonaPlexModelRunner)
     runner.model = model
+    runner.output_processor = SGLangOutputProcessor()
+    runner.async_query_hit = runner.async_query_miss = 0
     return runner
 
 
@@ -419,3 +428,199 @@ def test_decode_uses_owned_device_feedback_before_host_commit() -> None:
     assert row[0].item() == 78
     assert torch.equal(row[1:9], model.depformer.calls[-1].codes[0])
     assert torch.equal(row[9:], timeline.user_rows[timeline.input_position(2)])
+
+
+class DeferredHostRows:
+    def __init__(self) -> None:
+        self.source: torch.Tensor | None = None
+        self.ready = False
+
+    def copy_(self, source: torch.Tensor, *, non_blocking: bool) -> None:
+        assert non_blocking
+        self.source = source
+
+    def clone(self) -> torch.Tensor:
+        assert self.ready, "Host staging was read before completion"
+        assert self.source is not None
+        return self.source.clone()
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        self.ready = True
+
+
+def pending_frame(runner, request, token: int) -> PendingStep:
+    host_rows = DeferredHostRows()
+    runner.next_host_staging = lambda shape, dtype: host_rows
+    result = SimpleNamespace(
+        next_token_ids=torch.tensor([token]), can_run_cuda_graph=True
+    )
+    frames = runner.post_decode_launch(result, None, [request])
+    batch = SimpleNamespace(reqs=[request.data.req])
+    return PendingStep(
+        event=host_rows,
+        launch_buf=frames,
+        forward_batch=None,
+        schedule_batch=batch,
+        batch_result=result,
+        scheduler_output=SchedulerOutput(requests=[request], batch_data=batch),
+    )
+
+
+def test_resolve_waits_for_its_copy_and_does_not_wait_for_next_step() -> None:
+    runner = make_runner(FakeModel())
+    request = make_request(5)
+    run_prefill(runner, [request], [77])
+    first = pending_frame(runner, request, 78)
+    second = pending_frame(runner, request, 79)
+    assert len(request.data.talker_model_inputs["agent_rows"]) == 1
+    output = runner.execute_resolve(first)
+    assert output.host_token_ids.tolist() == [78]
+    assert not second.event.query()
+    frames = request.data.talker_model_inputs["frames"]
+    first_frame = frames[-1].clone()
+    first.launch_buf.host_rows.source.fill_(999)
+    assert torch.equal(frames[-1], first_frame)
+    runner.execute_resolve(second)
+    assert len(frames) == 3
+
+
+def test_retract_discards_uncommitted_audio_draw_and_replays_it() -> None:
+    def setup():
+        model = FakeModel()
+        model.depformer = SamplingDepformer()
+        runner = make_runner(model)
+        request = make_request(6, params={"seed": 7})
+        run_prefill(runner, [request], [77])
+        return runner, request
+
+    reference, expected = setup()
+    for token in (78, 79):
+        reference.post_decode(
+            SimpleNamespace(next_token_ids=torch.tensor([token])),
+            None,
+            None,
+            [expected],
+        )
+    runner, request = setup()
+    committed = pending_frame(runner, request, 78)
+    discarded = pending_frame(runner, request, 79)
+    runner.execute_resolve(committed)
+    request.data.req.is_retracted = True
+    runner.execute_resolve(discarded)
+    assert len(request.data.talker_model_inputs["frames"]) == 2
+    request.data.req.is_retracted = False
+    runner.before_prefill(
+        SimpleNamespace(
+            replace_embeds=None,
+            input_ids=torch.zeros(
+                request.data.talker_model_inputs["timeline"].num_prompt_positions + 2
+            ),
+        ),
+        SimpleNamespace(reqs=[SimpleNamespace(output_ids=[77, 78])]),
+        [request],
+    )
+    runner.post_prefill(
+        SimpleNamespace(next_token_ids=torch.tensor([79])), None, None, [request]
+    )
+    for actual, target in zip(
+        request.data.talker_model_inputs["frames"],
+        expected.data.talker_model_inputs["frames"],
+        strict=True,
+    ):
+        assert torch.equal(actual, target)
+    assert runner.rows_on_device(request.data).launched_frames == 3
+
+
+def test_lookahead_requires_budget_caller_row_and_history_free_sampling(
+    monkeypatch,
+) -> None:
+    runner = make_runner(FakeModel())
+    request = make_request(3)
+    run_prefill(runner, [request], [77])
+    request.data.req.omni_data = request.data
+    batch = SimpleNamespace(reqs=[request.data.req])
+    monkeypatch.setattr(
+        PersonaPlexModelRunner,
+        "model_device",
+        property(lambda self: torch.device("cuda")),
+    )
+    rows = runner.rows_on_device(request.data)
+    assert runner.lookahead_eligible(batch)
+    rows.launched_frames = 3
+    assert not runner.lookahead_eligible(batch)
+    rows.launched_frames = 1
+    caller_rows = rows.user_rows
+    rows.user_rows = caller_rows[
+        : request.data.talker_model_inputs["timeline"].input_position(1)
+    ]
+    assert not runner.lookahead_eligible(batch)
+    rows.user_rows = caller_rows
+    request.data.req.sampling_params.repetition_penalty = 1.2
+    assert not runner.lookahead_eligible(batch)
+    request.data.req.sampling_params.repetition_penalty = 1.0
+    request.data.return_logprob = True
+    assert not runner.lookahead_eligible(batch)
+
+
+def test_seed_cache_tracks_batch_members_and_reuses_device_tensor() -> None:
+    runner = make_runner(FakeModel())
+    first = make_request(3, params={"seed": 7}, request_id="first")
+    second = make_request(3, params={"seed": 8}, request_id="second")
+    tensors = []
+    for requests in ([first], [first], [second], [second, first]):
+        forward = SimpleNamespace(
+            sampling_info=SimpleNamespace(
+                sampling_seed=None,
+                device="cpu",
+                need_min_p_sampling=False,
+                need_top_p_sampling=False,
+                need_top_k_sampling=False,
+            )
+        )
+        runner.install_sampling_seeds(forward, requests)
+        tensors.append(forward.sampling_info.sampling_seed)
+    assert tensors[0] is tensors[1]
+    assert tensors[2] is not tensors[1]
+    assert tensors[3].tolist() == [int(tensors[2][0]), int(tensors[0][0])]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_resolve_cuda_copy_while_next_forward_is_slow() -> None:
+    runner = make_runner(FakeModel())
+    request = make_request(4)
+    run_prefill(runner, [request], [77])
+    device_rows = torch.arange(9, device="cuda").view(1, 9)
+    host_rows = torch.empty((1, 9), dtype=torch.long, pin_memory=True)
+    host_rows.copy_(device_rows, non_blocking=True)
+    completed = torch.cuda.Event()
+    completed.record()
+    completed.synchronize()
+    frames = PersonaPlexFrameBatch(
+        host_rows=host_rows, agent_rows=device_rows[:, 1:], audio_rng_states=[None]
+    )
+    batch = SimpleNamespace(reqs=[request.data.req])
+    pending = PendingStep(
+        event=completed,
+        launch_buf=frames,
+        forward_batch=None,
+        schedule_batch=batch,
+        batch_result=SimpleNamespace(
+            next_token_ids=device_rows[:, 0], can_run_cuda_graph=True
+        ),
+        scheduler_output=SchedulerOutput(requests=[request], batch_data=batch),
+    )
+    torch.cuda._sleep(500_000_000)  # noqa: leading-underscore
+    next_completed = torch.cuda.Event()
+    next_completed.record()
+    try:
+        output = runner.execute_resolve(pending)
+        assert output.host_token_ids.tolist() == [0]
+        assert not next_completed.query(), "Resolving N waited for N+1"
+        assert request.data.talker_model_inputs["frames"][-1].tolist() == list(
+            range(1, 9)
+        )
+    finally:
+        next_completed.synchronize()

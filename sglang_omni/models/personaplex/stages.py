@@ -175,6 +175,7 @@ def create_mimi_encode_executor(
 def create_lm_executor(
     model_path: str,
     *,
+    enable_async_decode: bool,
     dtype: str | None = None,
     device: str | None = None,
     gpu_id: int | None = None,
@@ -187,7 +188,9 @@ def create_lm_executor(
     # overrides, so an engine context_length must reach the builder too.
     context_length = server_args_overrides.get("context_length", context_length)
     builder = PersonaPlexEngineBuilder(
-        max_running_requests=1, context_length=context_length
+        max_running_requests=1,
+        context_length=context_length,
+        enable_async_decode=enable_async_decode,
     )
     return builder.build(
         model_path,

@@ -46,6 +46,14 @@ class DeviceRows:
     agent_row: torch.Tensor
     text_token: torch.Tensor | None = None
     launched_frames: int = 0
+    audio_rng_state: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class PersonaPlexFrameBatch:
+    host_rows: torch.Tensor
+    agent_rows: torch.Tensor
+    audio_rng_states: list[torch.Tensor | None]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -58,6 +66,9 @@ class SamplingRun:
 
 
 class PersonaPlexModelRunner(ModelRunner):
+    sampling_seed_key: tuple[tuple[str, int | None], ...] = ()
+    sampling_seed_tensor: torch.Tensor | None = None
+
     def sample_before_post_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -75,9 +86,53 @@ class PersonaPlexModelRunner(ModelRunner):
         return True
 
     def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
-        # Note (wilsonzheng0327): The depformer must see this step's sampled text before
-        # the next forward is prepared; a one-step lookahead would run it a step late.
-        return False
+        if self.model_device.type != "cuda" or not super().lookahead_eligible(batch):
+            return False
+        else:
+            pass
+        for request in batch.reqs:
+            data = request.omni_data
+            timeline = self.request_timeline(data)
+            rows = self.rows_on_device(data)
+            # Note (edwardzh): The last caller row still exists after the output budget is exhausted.
+            if (
+                data.return_logprob
+                or rows.launched_frames >= min(timeline.num_frames, data.max_new_tokens)
+                or timeline.input_position(rows.launched_frames)
+                >= rows.user_rows.shape[0]
+            ):
+                return False
+            else:
+                pass
+        return True
+
+    def install_sampling_seeds(
+        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
+    ) -> None:
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.sampling_seed is not None:
+            self.validate_seeded_sampling_supported(sampling_info)
+            return
+        else:
+            pass
+        seed_key = tuple(
+            (request.request_id, request.data.req.sampling_params.sampling_seed)
+            for request in requests
+        )
+        if seed_key == self.sampling_seed_key:
+            sampling_info.sampling_seed = self.sampling_seed_tensor
+            if self.sampling_seed_tensor is not None:
+                self.validate_seeded_sampling_supported(sampling_info)
+            else:
+                pass
+        else:
+            # Note (edwardzh): A pageable seed upload after forward waits for the backbone.
+            super().install_sampling_seeds(forward_batch, requests)
+            self.sampling_seed_key = tuple(
+                (request.request_id, request.data.req.sampling_params.sampling_seed)
+                for request in requests
+            )
+            self.sampling_seed_tensor = sampling_info.sampling_seed
 
     @property
     def model_device(self) -> torch.device:
@@ -172,8 +227,10 @@ class PersonaPlexModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
         text_token_B: torch.Tensor,
         forced_BK: torch.Tensor,
-    ) -> None:
-        """Run the depformer for the positions just predicted and record them.
+        *,
+        non_blocking: bool = False,
+    ) -> PersonaPlexFrameBatch:
+        """Prepare frame results for the positions just predicted.
 
         Row i of text_token_B, forced_BK and hidden_out belongs to requests[i].
         """
@@ -186,6 +243,8 @@ class PersonaPlexModelRunner(ModelRunner):
         )
         # Note (edwardzh): Sampling buffers can be reused before host results commit.
         text_tokens = text_token_B[:batch_size].clone()
+        frames = []
+        audio_rng_states = []
         for request, codes, text_token in zip(
             requests, codes_BK, text_tokens, strict=True
         ):
@@ -196,9 +255,66 @@ class PersonaPlexModelRunner(ModelRunner):
             device_rows.agent_row = codes
             device_rows.text_token = text_token
             device_rows.launched_frames += 1
-            inputs["agent_rows"].append(codes)
-            inputs["frames"].append(frame)
-            inputs["pending_frames"].append(frame)
+            frames.append(frame)
+            generator = inputs.get("audio_generator")
+            audio_rng_states.append(
+                generator.get_state() if generator is not None else None
+            )
+        packed_rows = torch.cat((text_tokens[:, None], torch.stack(frames)), dim=1)
+        if non_blocking:
+            host_rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)
+            host_rows.copy_(packed_rows, non_blocking=True)
+        else:
+            host_rows = packed_rows.cpu()
+        return PersonaPlexFrameBatch(
+            host_rows=host_rows,
+            agent_rows=codes_BK,
+            audio_rng_states=audio_rng_states,
+        )
+
+    def commit_frames(
+        self,
+        frames: PersonaPlexFrameBatch,
+        result: GenerationBatchResult,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        # Note (edwardzh): Timeline history outlives the next reuse of pinned staging.
+        host_rows = frames.host_rows.clone()
+        self.stage_token_ids(result, host_rows[:, 0])
+        for index, request in enumerate(requests):
+            data = request.data
+            if data.req.finished() or data.req.is_retracted:
+                continue
+            else:
+                pass
+            inputs = data.talker_model_inputs
+            inputs["agent_rows"].append(frames.agent_rows[index])
+            inputs["frames"].append(host_rows[index, 1:])
+            inputs["pending_frames"].append(host_rows[index, 1:])
+            self.rows_on_device(data).audio_rng_state = frames.audio_rng_states[index]
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+    ) -> PersonaPlexFrameBatch:
+        return self.spell_frames(
+            requests,
+            result.next_token_ids,
+            self.free_codes().expand(len(requests), -1),
+            non_blocking=True,
+        )
+
+    def post_decode_resolve(
+        self,
+        launch_buf: PersonaPlexFrameBatch,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        self.commit_frames(launch_buf, result, requests)
 
     def free_codes(self) -> torch.Tensor:
         return torch.full(
@@ -237,7 +353,14 @@ class PersonaPlexModelRunner(ModelRunner):
             data = request.data
             inputs = data.talker_model_inputs
             generated = [int(token) for token in req.output_ids]
-            self.rows_on_device(data).launched_frames = len(generated)
+            device_rows = self.rows_on_device(data)
+            device_rows.launched_frames = len(generated)
+            generator = inputs.get("audio_generator")
+            if generator is not None and device_rows.audio_rng_state is not None:
+                # Note (edwardzh): Discarded lookahead must not consume a seeded audio draw.
+                generator.set_state(device_rows.audio_rng_state)
+            else:
+                pass
             prompt_rows = self.prefill_rows(data)
             if not generated:
                 inputs["prefill_forced"] = self.request_timeline(
@@ -276,7 +399,8 @@ class PersonaPlexModelRunner(ModelRunner):
                 for request in requests
             ]
         )
-        self.spell_frames(requests, result.next_token_ids, forced_BK)
+        frames = self.spell_frames(requests, result.next_token_ids, forced_BK)
+        self.commit_frames(frames, result, requests)
 
     def before_decode(
         self,
@@ -312,4 +436,5 @@ class PersonaPlexModelRunner(ModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         free_BK = self.free_codes().expand(len(requests), -1)
-        self.spell_frames(requests, result.next_token_ids, free_BK)
+        frames = self.spell_frames(requests, result.next_token_ids, free_BK)
+        self.commit_frames(frames, result, requests)
