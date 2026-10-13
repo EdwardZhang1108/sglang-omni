@@ -402,3 +402,20 @@ def test_resume_after_a_retract_replays_the_generated_positions() -> None:
     state = PersonaPlexState.from_dict(apply_lm_result(data).data)
     assert state.text_ids == [3, 77, 78, 79]
     assert data.output_ids == [77, 78, 79, 80]
+
+
+def test_decode_uses_owned_device_feedback_before_host_commit() -> None:
+    model = FakeModel()
+    runner = make_runner(model)
+    request = make_request(4)
+    run_prefill(runner, [request], [77])
+    sampled = torch.tensor([78])
+    runner.post_decode(SimpleNamespace(next_token_ids=sampled), None, None, [request])
+    sampled.fill_(999)
+
+    runner.before_decode(None, None, [request], is_lookahead=True)
+    timeline = request.data.talker_model_inputs["timeline"]
+    row = model.fusion_buffer[0].long()
+    assert row[0].item() == 78
+    assert torch.equal(row[1:9], model.depformer.calls[-1].codes[0])
+    assert torch.equal(row[9:], timeline.user_rows[timeline.input_position(2)])

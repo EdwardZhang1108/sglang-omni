@@ -40,6 +40,14 @@ class AudioTokenSampler(Protocol):
     def __call__(self, logits: torch.Tensor) -> torch.Tensor: ...
 
 
+@dataclass(kw_only=True)
+class DeviceRows:
+    user_rows: torch.Tensor
+    agent_row: torch.Tensor
+    text_token: torch.Tensor | None = None
+    launched_frames: int = 0
+
+
 @dataclass(frozen=True, kw_only=True)
 class SamplingRun:
     """Adjacent batch rows that share one sample_token call."""
@@ -79,16 +87,16 @@ class PersonaPlexModelRunner(ModelRunner):
     def request_timeline(data: SGLangARRequestData) -> Timeline:
         return data.talker_model_inputs["timeline"]
 
-    def rows_on_device(self, data: SGLangARRequestData) -> dict[str, torch.Tensor]:
+    def rows_on_device(self, data: SGLangARRequestData) -> DeviceRows:
         """Move the request's timeline tensors to the device once."""
         inputs = data.talker_model_inputs
         cached = inputs.get("device_rows")
         if cached is None:
             timeline = self.request_timeline(data)
-            cached = {
-                "user_rows": timeline.user_rows.to(self.model_device),
-                "agent_row": timeline.agent_row_before_start.to(self.model_device),
-            }
+            cached = DeviceRows(
+                user_rows=timeline.user_rows.to(self.model_device),
+                agent_row=timeline.agent_row_before_start.to(self.model_device),
+            )
             inputs["device_rows"] = cached
         else:
             pass
@@ -176,12 +184,18 @@ class PersonaPlexModelRunner(ModelRunner):
             forced_BK,
             self.audio_sampler(requests),
         )
-        for request, codes in zip(requests, codes_BK, strict=True):
+        # Note (edwardzh): Sampling buffers can be reused before host results commit.
+        text_tokens = text_token_B[:batch_size].clone()
+        for request, codes, text_token in zip(
+            requests, codes_BK, text_tokens, strict=True
+        ):
             data = request.data
             inputs = data.talker_model_inputs
             device_rows = self.rows_on_device(data)
-            frame = output_frame(device_rows["agent_row"], codes)
-            device_rows["agent_row"] = codes
+            frame = output_frame(device_rows.agent_row, codes)
+            device_rows.agent_row = codes
+            device_rows.text_token = text_token
+            device_rows.launched_frames += 1
             inputs["agent_rows"].append(codes)
             inputs["frames"].append(frame)
             inputs["pending_frames"].append(frame)
@@ -209,7 +223,7 @@ class PersonaPlexModelRunner(ModelRunner):
         for index, token in enumerate(generated):
             rows[index, 0] = int(token)
             rows[index, AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = agent_rows[index]
-            rows[index, USER_STREAM_OFFSET:] = device_rows["user_rows"][start + index]
+            rows[index, USER_STREAM_OFFSET:] = device_rows.user_rows[start + index]
         return model.embed_rows(rows).to(model.fusion_buffer.dtype)
 
     def before_prefill(
@@ -223,6 +237,7 @@ class PersonaPlexModelRunner(ModelRunner):
             data = request.data
             inputs = data.talker_model_inputs
             generated = [int(token) for token in req.output_ids]
+            self.rows_on_device(data).launched_frames = len(generated)
             prompt_rows = self.prefill_rows(data)
             if not generated:
                 inputs["prefill_forced"] = self.request_timeline(
@@ -234,7 +249,7 @@ class PersonaPlexModelRunner(ModelRunner):
                 pass
             # Note (wilsonzheng0327): Resuming a retracted request replays the prompt
             # and every generated position, so those rows are embedded again too.
-            self.rows_on_device(data)["agent_row"] = inputs["agent_rows"][
+            self.rows_on_device(data).agent_row = inputs["agent_rows"][
                 len(generated) - 1
             ]
             inputs["prefill_forced"] = self.free_codes()
@@ -273,15 +288,16 @@ class PersonaPlexModelRunner(ModelRunner):
     ) -> None:
         model = self.model
         rows = []
-        for request, req in zip(requests, schedule_batch.reqs, strict=True):
+        for request in requests:
             data = request.data
             timeline = self.request_timeline(data)
             device_rows = self.rows_on_device(data)
-            position = timeline.input_position(len(req.output_ids))
+            position = timeline.input_position(device_rows.launched_frames)
             row = torch.empty(NUM_STREAMS, dtype=torch.long, device=self.model_device)
-            row[0] = int(req.output_ids[-1])
-            row[AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = device_rows["agent_row"]
-            row[USER_STREAM_OFFSET:] = device_rows["user_rows"][position]
+            assert device_rows.text_token is not None
+            row[0] = device_rows.text_token
+            row[AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = device_rows.agent_row
+            row[USER_STREAM_OFFSET:] = device_rows.user_rows[position]
             rows.append(row)
         batch = len(rows)
         model.fusion_buffer[:batch] = model.embed_rows(torch.stack(rows)).to(
