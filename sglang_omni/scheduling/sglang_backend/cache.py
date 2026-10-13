@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, PureSWAChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_memory, get_schedule, get_serving
 from sglang.srt.session.streaming_session import StreamingSession
@@ -26,6 +26,15 @@ def create_tree_cache(
     sliding_window_size: int | None,
 ) -> BasePrefixCache:
     """Select the allocator's cache and wrap it for streaming sessions."""
+    if not get_memory().disable_radix_cache and isinstance(
+        req_to_token_pool, HybridReqToTokenPool
+    ):
+        raise ValueError(
+            "Radix cache restores attention KV but not hybrid linear-attention "
+            "state; set disable_radix_cache=True for hybrid models"
+        )
+    else:
+        pass
     cache_init_arguments = {
         "disable": get_memory().disable_radix_cache,
         "req_to_token_pool": req_to_token_pool,

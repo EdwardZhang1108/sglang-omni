@@ -177,6 +177,11 @@ class SuccessfulSpeechClient:
             audio_bytes=b"RIFF",
             mime_type=f"audio/{response_format}",
             format=response_format,
+            usage=UsageInfo(
+                prompt_tokens=5,
+                completion_tokens=2,
+                total_tokens=7,
+            ),
             finish_reason=self.finish_reason,
         )
 
@@ -935,6 +940,11 @@ def test_speech_endpoint_returns_binary_audio() -> None:
     assert response.content == b"RIFF"
     assert response.headers["content-type"] == "audio/wav"
     assert response.headers["x-finish-reason"] == "length"
+    assert response.headers["x-prompt-tokens"] == "5"
+    assert response.headers["x-completion-tokens"] == "2"
+    assert response.headers["x-sglang-omni-input-tokens"] == "5"
+    assert response.headers["x-sglang-omni-output-tokens"] == "2"
+    assert response.headers["x-sglang-omni-total-tokens"] == "7"
     assert response.headers["x-request-id"].startswith("speech-")
     assert speech_client.speech_requests[0].model == "tts"
     assert isinstance(speech_client.speech_requests[0].metadata["tts_params"], dict)
@@ -2017,6 +2027,38 @@ def test_speech_response_returns_when_disconnect_poll_is_false() -> None:
         assert result.audio_bytes == b"RIFF"
 
     asyncio.run(drive())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_supported_speech_fields_refuse_an_unknown_field_before_generation(
+    stream: bool,
+) -> None:
+    client_impl = SuccessfulSpeechClient()
+    client = TestClient(
+        create_app(
+            client_impl,
+            model_name="tts",
+            supported_speech_fields=frozenset(
+                {"model", "input", "voice", "response_format", "stream"}
+            ),
+        )
+    )
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "tts",
+            "input": "hello",
+            "stream": stream,
+            "response_format": "pcm" if stream else "wav",
+            "stage_sampling": {},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "stage_sampling"
+    assert client_impl.generate_requests == []
+    assert client_impl.speech_requests == []
 
 
 def test_speech_request_records_explicit_generation_params() -> None:

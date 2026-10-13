@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -64,6 +64,37 @@ def test_factory_passes_the_eviction_policy_config_to_the_strategy() -> None:
         )
 
     assert cache.eviction_strategy.protected_threshold == 4
+
+
+@pytest.mark.parametrize("eviction_policy", ["lru", "fifo"])
+def test_factory_refuses_radix_for_hybrid_state_pools(eviction_policy: str) -> None:
+    """A radix hit restores attention KV but never the linear-attention state."""
+    hybrid_pool = object.__new__(HybridReqToTokenPool)
+    with get_context().override_server_args(
+        disable_radix_cache=False,
+        chunked_prefill_size=None,
+        radix_eviction_policy=eviction_policy,
+    ):
+        with pytest.raises(ValueError, match="disable_radix_cache"):
+            create_tree_cache(
+                hybrid_pool,
+                Mock(spec=BaseTokenToKVPoolAllocator, device="cpu"),
+                1,
+                None,
+            )
+
+
+def test_factory_keeps_chunk_cache_for_hybrid_state_pools() -> None:
+    hybrid_pool = object.__new__(HybridReqToTokenPool)
+    with get_context().override_server_args(
+        disable_radix_cache=True,
+        chunked_prefill_size=100,
+    ):
+        cache = create_tree_cache(
+            hybrid_pool, Mock(spec=BaseTokenToKVPoolAllocator, device="cpu"), 1, None
+        )
+
+    assert type(cache) is ChunkCache
 
 
 def make_window_cache(
