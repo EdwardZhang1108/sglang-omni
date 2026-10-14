@@ -121,8 +121,9 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
-        state = self.stream_state(request_id)
         codes_FK = torch.as_tensor(item.data, dtype=torch.long)
+        assert codes_FK.device.type == "cpu", "PersonaPlex stream codes must be on CPU"
+        state = self.stream_state(request_id)
         state.pending_codes.append(codes_FK)
         state.pending_frames += codes_FK.shape[0]
         # Note (wilsonzheng0327): The terminal payload only arrives after the LM finishes,
@@ -152,10 +153,6 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         )
         state.pending_frames -= frame_count
         state.decodes_done += 1
-        if self.decode_stream is not None and codes_FK.is_cuda:
-            self.decode_stream.wait_stream(torch.cuda.current_stream(codes_FK.device))
-        else:
-            pass
         # Note (edwardzh): The codec worker waits only for its own copies and decode,
         # not the LM's next forward queued concurrently on the default stream.
         with self.decode_context():

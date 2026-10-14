@@ -41,7 +41,7 @@ class AudioTokenSampler(Protocol):
 
 
 @dataclass(kw_only=True)
-class DeviceRows:
+class DecodeFeedback:
     user_rows: torch.Tensor
     agent_row: torch.Tensor
     text_token: torch.Tensor | None = None
@@ -93,14 +93,9 @@ class PersonaPlexModelRunner(ModelRunner):
         for request in batch.reqs:
             data = request.omni_data
             timeline = self.request_timeline(data)
-            rows = self.rows_on_device(data)
+            rows = self.decode_feedback(data)
             # Note (edwardzh): The last caller row still exists after the output budget is exhausted.
-            if (
-                data.return_logprob
-                or rows.launched_frames >= min(timeline.num_frames, data.max_new_tokens)
-                or timeline.input_position(rows.launched_frames)
-                >= rows.user_rows.shape[0]
-            ):
+            if data.return_logprob or rows.launched_frames >= timeline.num_frames:
                 return False
             else:
                 pass
@@ -128,6 +123,7 @@ class PersonaPlexModelRunner(ModelRunner):
         else:
             # Note (edwardzh): A pageable seed upload after forward waits for the backbone.
             super().install_sampling_seeds(forward_batch, requests)
+            # Note (edwardzh): The base hook may normalize seeds, so cache the updated key.
             self.sampling_seed_key = tuple(
                 (request.request_id, request.data.req.sampling_params.sampling_seed)
                 for request in requests
@@ -142,17 +138,17 @@ class PersonaPlexModelRunner(ModelRunner):
     def request_timeline(data: SGLangARRequestData) -> Timeline:
         return data.talker_model_inputs["timeline"]
 
-    def rows_on_device(self, data: SGLangARRequestData) -> DeviceRows:
-        """Move the request's timeline tensors to the device once."""
+    def decode_feedback(self, data: SGLangARRequestData) -> DecodeFeedback:
+        """Cache device inputs and per-request decode state."""
         inputs = data.talker_model_inputs
-        cached = inputs.get("device_rows")
+        cached = inputs.get("decode_feedback")
         if cached is None:
             timeline = self.request_timeline(data)
-            cached = DeviceRows(
+            cached = DecodeFeedback(
                 user_rows=timeline.user_rows.to(self.model_device),
                 agent_row=timeline.agent_row_before_start.to(self.model_device),
             )
-            inputs["device_rows"] = cached
+            inputs["decode_feedback"] = cached
         else:
             pass
         return cached
@@ -250,11 +246,11 @@ class PersonaPlexModelRunner(ModelRunner):
         ):
             data = request.data
             inputs = data.talker_model_inputs
-            device_rows = self.rows_on_device(data)
-            frame = output_frame(device_rows.agent_row, codes)
-            device_rows.agent_row = codes
-            device_rows.text_token = text_token
-            device_rows.launched_frames += 1
+            feedback = self.decode_feedback(data)
+            frame = output_frame(feedback.agent_row, codes)
+            feedback.agent_row = codes
+            feedback.text_token = text_token
+            feedback.launched_frames += 1
             frames.append(frame)
             generator = inputs.get("audio_generator")
             audio_rng_states.append(
@@ -280,8 +276,7 @@ class PersonaPlexModelRunner(ModelRunner):
         result: GenerationBatchResult,
         requests: list[SchedulerRequest],
     ) -> None:
-        # Note (edwardzh): Timeline history outlives the next reuse of pinned staging.
-        host_rows = frames.host_rows.clone()
+        host_rows = frames.host_rows
         self.stage_token_ids(result, host_rows[:, 0])
         for index, request in enumerate(requests):
             data = request.data
@@ -293,7 +288,7 @@ class PersonaPlexModelRunner(ModelRunner):
             inputs["agent_rows"].append(frames.agent_rows[index])
             inputs["frames"].append(host_rows[index, 1:])
             inputs["pending_frames"].append(host_rows[index, 1:])
-            self.rows_on_device(data).audio_rng_state = frames.audio_rng_states[index]
+            self.decode_feedback(data).audio_rng_state = frames.audio_rng_states[index]
 
     def post_decode_launch(
         self,
@@ -316,6 +311,8 @@ class PersonaPlexModelRunner(ModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
+        # Note (edwardzh): Committed history outlives the next reuse of pinned staging.
+        launch_buf.host_rows = launch_buf.host_rows.clone()
         self.commit_frames(launch_buf, result, requests)
 
     def free_codes(self) -> torch.Tensor:
@@ -332,7 +329,7 @@ class PersonaPlexModelRunner(ModelRunner):
         """Embed the positions already generated, replayed after a retract."""
         model = self.model
         timeline = self.request_timeline(data)
-        device_rows = self.rows_on_device(data)
+        feedback = self.decode_feedback(data)
         agent_rows = data.talker_model_inputs["agent_rows"]
         start = timeline.num_prompt_positions
         rows = torch.empty(
@@ -341,7 +338,7 @@ class PersonaPlexModelRunner(ModelRunner):
         for index, token in enumerate(generated):
             rows[index, 0] = int(token)
             rows[index, AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = agent_rows[index]
-            rows[index, USER_STREAM_OFFSET:] = device_rows.user_rows[start + index]
+            rows[index, USER_STREAM_OFFSET:] = feedback.user_rows[start + index]
         return model.embed_rows(rows).to(model.fusion_buffer.dtype)
 
     def before_prefill(
@@ -355,12 +352,12 @@ class PersonaPlexModelRunner(ModelRunner):
             data = request.data
             inputs = data.talker_model_inputs
             generated = [int(token) for token in req.output_ids]
-            device_rows = self.rows_on_device(data)
-            device_rows.launched_frames = len(generated)
+            feedback = self.decode_feedback(data)
+            feedback.launched_frames = len(generated)
             generator = inputs.get("audio_generator")
-            if generator is not None and device_rows.audio_rng_state is not None:
+            if generator is not None and feedback.audio_rng_state is not None:
                 # Note (edwardzh): Discarded lookahead must not consume a seeded audio draw.
-                generator.set_state(device_rows.audio_rng_state)
+                generator.set_state(feedback.audio_rng_state)
             else:
                 pass
             prompt_rows = self.prefill_rows(data)
@@ -374,7 +371,7 @@ class PersonaPlexModelRunner(ModelRunner):
                 pass
             # Note (wilsonzheng0327): Resuming a retracted request replays the prompt
             # and every generated position, so those rows are embedded again too.
-            self.rows_on_device(data).agent_row = inputs["agent_rows"][
+            self.decode_feedback(data).agent_row = inputs["agent_rows"][
                 len(generated) - 1
             ]
             inputs["prefill_forced"] = self.free_codes()
@@ -417,13 +414,13 @@ class PersonaPlexModelRunner(ModelRunner):
         for request in requests:
             data = request.data
             timeline = self.request_timeline(data)
-            device_rows = self.rows_on_device(data)
-            position = timeline.input_position(device_rows.launched_frames)
+            feedback = self.decode_feedback(data)
+            position = timeline.input_position(feedback.launched_frames)
             row = torch.empty(NUM_STREAMS, dtype=torch.long, device=self.model_device)
-            assert device_rows.text_token is not None
-            row[0] = device_rows.text_token
-            row[AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = device_rows.agent_row
-            row[USER_STREAM_OFFSET:] = device_rows.user_rows[position]
+            assert feedback.text_token is not None
+            row[0] = feedback.text_token
+            row[AGENT_STREAM_OFFSET:USER_STREAM_OFFSET] = feedback.agent_row
+            row[USER_STREAM_OFFSET:] = feedback.user_rows[position]
             rows.append(row)
         batch = len(rows)
         model.fusion_buffer[:batch] = model.embed_rows(torch.stack(rows)).to(

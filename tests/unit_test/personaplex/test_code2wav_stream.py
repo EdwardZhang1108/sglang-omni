@@ -2,6 +2,7 @@
 """The streaming codec stage renders per-request chunks into the whole-reply waveform."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -527,13 +528,128 @@ def test_codec_chunk_does_not_wait_for_unrelated_forward(
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_codec_stream_accepts_codes_from_the_current_cuda_stream(
-    random_codec: MimiCodec,
+def test_codec_rejects_cuda_codes_before_acquiring_a_slot(
+    random_codec: MimiCodec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    scheduler = new_scheduler(random_codec.cuda(), (1, 4))
-    codes = torch.randint(0, 2048, (5, 8), generator=torch.Generator().manual_seed(43))
-    expected = push_frames(scheduler, "cpu", codes)
-    scheduler.clear_stream_state("cpu")
-    actual = push_frames(scheduler, "cuda", codes.cuda())
-    assert torch.equal(torch.cat(actual), torch.cat(expected))
-    scheduler.clear_stream_state("cuda")
+    scheduler = new_scheduler(random_codec)
+    acquire = Mock(wraps=scheduler.decode_slots.acquire)
+    monkeypatch.setattr(scheduler.decode_slots, "acquire", acquire)
+    codes = torch.zeros((1, 8), dtype=torch.long, device="cuda")
+    with pytest.raises(AssertionError, match="stream codes must be on CPU"):
+        push_frames(scheduler, "reply", codes)
+    acquire.assert_not_called()
+    assert "reply" not in scheduler.stream_states
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available()
+                    or not current_platform.enable_codec_decode_graph(),
+                    reason="requires CUDA codec decode graphs",
+                ),
+            ],
+        ),
+    ],
+)
+def test_interleaved_requests_reuse_cancelled_slots_and_flush_late_payloads(
+    random_codec: MimiCodec, device: str
+) -> None:
+    slots = MimiDecodeSlots(
+        random_codec.to(device),
+        num_slots=2,
+        max_graph_frames=2,
+        max_chunk_frames=4,
+    )
+    scheduler = PersonaPlexCode2WavScheduler(
+        slots, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
+    )
+    generator = torch.Generator().manual_seed(27892792)
+    codes = {
+        request_id: torch.randint(0, 2048, (frames, 8), generator=generator)
+        for request_id, frames in (("a", 6), ("aborted", 7), ("c", 9), ("d", 7))
+    }
+    payloads = {
+        request_id: StagePayload(
+            request_id,
+            request=OmniRequest(inputs={}),
+            data=PersonaPlexState(codes=request_codes).to_dict(),
+        )
+        for request_id, request_codes in codes.items()
+    }
+
+    def push(request_id: str, first_frame: int, last_frame: int) -> None:
+        scheduler.handle_stream_chunk(
+            request_id,
+            StreamItem(
+                chunk_id=first_frame,
+                data=codes[request_id][first_frame:last_frame],
+                from_stage="lm",
+            ),
+        )
+
+    expected: dict[str, torch.Tensor] = {}
+    for request_id in ("a", "c", "d"):
+        start_stream(scheduler, request_id)
+        push(request_id, 0, len(codes[request_id]))
+        scheduler.handle_stream_done(request_id)
+        messages = drain_messages(scheduler)
+        expected[request_id] = decode_waveform(messages[-1].data.data)
+
+    for request_id in ("a", "aborted"):
+        push(request_id, 0, 1)
+    scheduler.handle_streaming_new_request("c", payloads["c"])
+    push("c", 0, 1)
+    if device == "cuda":
+        assert scheduler.stream_states["a"].decode_slot.index is not None
+        assert scheduler.stream_states["aborted"].decode_slot.index is not None
+        assert scheduler.stream_states["c"].decode_slot.index is None
+    else:
+        pass
+
+    push("aborted", 1, 3)
+    scheduler.abort("aborted")
+    assert "aborted" not in scheduler.stream_states
+    push("d", 0, 1)
+    if device == "cuda":
+        assert scheduler.stream_states["d"].decode_slot.index is not None
+    else:
+        pass
+
+    for frame in range(1, 9):
+        for request_id in ("a", "c", "d"):
+            if frame < len(codes[request_id]):
+                push(request_id, frame, frame + 1)
+            else:
+                pass
+    for request_id in ("a", "c", "d"):
+        scheduler.handle_stream_done(request_id)
+        if request_id != "c":
+            scheduler.handle_streaming_new_request(request_id, payloads[request_id])
+        else:
+            pass
+        assert request_id not in scheduler.stream_states
+
+    messages = drain_messages(scheduler)
+    for request_id in ("a", "c", "d"):
+        selected = [message for message in messages if message.request_id == request_id]
+        assert [message.type for message in selected].count("result") == 1
+        assert selected[-1].type == "result"
+        actual = torch.cat([decode_waveform(message.data) for message in selected[:-1]])
+        assert torch.equal(actual, expected[request_id])
+        assert torch.equal(
+            decode_waveform(selected[-1].data.data), expected[request_id]
+        )
+    aborted = [message for message in messages if message.request_id == "aborted"]
+    assert len(aborted) == 1 and aborted[0].type == "stream"
+    assert not scheduler.stream_states and not scheduler.pending_done
+    if device == "cuda":
+        assert sorted(slots.free_slots) == [0, 1]
+    else:
+        pass

@@ -491,7 +491,7 @@ def test_resolve_waits_for_its_copy_and_does_not_wait_for_next_step() -> None:
     assert not second.event.query()
     frames = request.data.talker_model_inputs["frames"]
     first_frame = frames[-1].clone()
-    first.launch_buf.host_rows.source.fill_(999)
+    first.event.source.fill_(999)
     assert torch.equal(frames[-1], first_frame)
     runner.execute_resolve(second)
     assert len(frames) == 3
@@ -503,36 +503,79 @@ def test_resolve_waits_for_its_copy_and_does_not_wait_for_next_step() -> None:
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.accelerator,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
-@pytest.mark.parametrize("batch_sizes", [(3, 2, 1), (3, 1)])
-def test_async_decode_with_shrinking_batch(
-    device: str, batch_sizes: tuple[int, ...]
+@pytest.mark.parametrize(
+    "request_orders",
+    [
+        [(2, 1, 0), (1, 0), (0,)],
+        [(2, 1, 0), (0,)],
+        [(0,), (2, 0, 1), (1, 2), (2,), (2,)],
+    ],
+    ids=["shrink-3-2-1", "shrink-3-1", "grow-shrink-reorder"],
+)
+def test_async_decode_with_changing_batches(
+    device: str, request_orders: list[tuple[int, ...]]
 ) -> None:
     model = FakeModel(max_batch=3)
     model.fusion_buffer = model.fusion_buffer.to(device)
     model.hidden_out = model.hidden_out.to(device)
     runner = make_runner(model)
-    runner.host_staging_buffers = [
-        torch.empty((3, 9), dtype=torch.long, pin_memory=device == "cuda")
-        for _ in range(2)
-    ]
+    runner.host_staging_buffers = (
+        []
+        if device == "cuda"
+        else [torch.empty((3, 9), dtype=torch.long) for _ in range(2)]
+    )
     runner.staging_slot = 0
-    requests = [make_request(5, request_id=f"r{index}") for index in range(3)]
+    requests = [make_request(8, request_id=f"r{index}") for index in range(3)]
     run_prefill(runner, requests, [70, 71, 72])
+    previous_tokens = [70, 71, 72]
+    previous_codes = list(model.depformer.calls[0].codes.cpu())
+    expected_frames = [
+        [request.data.talker_model_inputs["frames"][0].clone()] for request in requests
+    ]
+    fused_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    pending: list[PendingStep] = []
+    expected_tokens = [
+        list(range(80 + 10 * step, 80 + 10 * step + len(order)))
+        for step, order in enumerate(request_orders)
+    ]
+    sampled_tokens = [torch.tensor(tokens, device=device) for tokens in expected_tokens]
 
-    for step, batch_size in enumerate(batch_sizes):
-        active_requests = requests[:batch_size][::-1]
-        previous_rows = [
-            runner.rows_on_device(request.data).agent_row.clone()
-            for request in active_requests
-        ]
-        tokens = torch.arange(batch_size, device=device) + 80 + 10 * step
-        result = SimpleNamespace(next_token_ids=tokens, can_run_cuda_graph=True)
+    for step, order in enumerate(request_orders):
+        active_requests = [requests[index] for index in order]
+        runner.before_decode(None, None, active_requests, is_lookahead=True)
+        expected_inputs = []
+        for index in order:
+            timeline = requests[index].data.talker_model_inputs["timeline"]
+            expected_inputs.append(
+                torch.cat(
+                    (
+                        torch.tensor([previous_tokens[index]]),
+                        previous_codes[index],
+                        timeline.user_rows[
+                            timeline.input_position(len(expected_frames[index]))
+                        ],
+                    )
+                )
+            )
+        fused_rows.append(
+            (
+                model.fusion_buffer[: len(order)].clone(),
+                torch.stack(expected_inputs).float(),
+            )
+        )
+        tokens = expected_tokens[step]
+        result = SimpleNamespace(
+            next_token_ids=sampled_tokens[step], can_run_cuda_graph=True
+        )
         frames = runner.post_decode_launch(result, None, active_requests)
         if device == "cuda":
             completed = torch.cuda.Event()
@@ -540,7 +583,7 @@ def test_async_decode_with_shrinking_batch(
         else:
             completed = SimpleNamespace(query=lambda: True)
         batch = SimpleNamespace(reqs=[request.data.req for request in active_requests])
-        output = runner.execute_resolve(
+        pending.append(
             PendingStep(
                 event=completed,
                 launch_buf=frames,
@@ -552,12 +595,26 @@ def test_async_decode_with_shrinking_batch(
                 ),
             )
         )
-        assert output.host_token_ids.tolist() == tokens.tolist()
-        for index, request in enumerate(active_requests):
-            expected = output_frame(previous_rows[index], frames.agent_rows[index])
-            assert torch.equal(
-                request.data.talker_model_inputs["frames"][-1], expected.cpu()
-            )
+        if step:
+            output = runner.execute_resolve(pending[step - 1])
+            assert output.host_token_ids.tolist() == expected_tokens[step - 1]
+        else:
+            pass
+        for row, index in enumerate(order):
+            codes = 1000 * (step + 2) + 100 * row + torch.arange(8)
+            expected_frames[index].append(output_frame(previous_codes[index], codes))
+            previous_tokens[index] = tokens[row]
+            previous_codes[index] = codes
+
+    output = runner.execute_resolve(pending[-1])
+    assert output.host_token_ids.tolist() == expected_tokens[-1]
+    for actual, expected in fused_rows:
+        assert torch.equal(actual.cpu(), expected)
+    for request, expected in zip(requests, expected_frames, strict=True):
+        actual = request.data.talker_model_inputs["frames"]
+        assert len(actual) == len(expected)
+        for actual_frame, expected_frame in zip(actual, expected, strict=True):
+            assert torch.equal(actual_frame, expected_frame)
 
 
 def test_retract_discards_uncommitted_audio_draw_and_replays_it() -> None:
@@ -604,10 +661,10 @@ def test_retract_discards_uncommitted_audio_draw_and_replays_it() -> None:
         strict=True,
     ):
         assert torch.equal(actual, target)
-    assert runner.rows_on_device(request.data).launched_frames == 3
+    assert runner.decode_feedback(request.data).launched_frames == 3
 
 
-def test_lookahead_requires_budget_caller_row_and_history_free_sampling(
+def test_lookahead_requires_budget_and_history_free_sampling(
     monkeypatch,
 ) -> None:
     runner = make_runner(FakeModel())
@@ -620,17 +677,11 @@ def test_lookahead_requires_budget_caller_row_and_history_free_sampling(
         "model_device",
         property(lambda self: torch.device("cuda")),
     )
-    rows = runner.rows_on_device(request.data)
+    rows = runner.decode_feedback(request.data)
     assert runner.lookahead_eligible(batch)
     rows.launched_frames = 3
     assert not runner.lookahead_eligible(batch)
     rows.launched_frames = 1
-    caller_rows = rows.user_rows
-    rows.user_rows = caller_rows[
-        : request.data.talker_model_inputs["timeline"].input_position(1)
-    ]
-    assert not runner.lookahead_eligible(batch)
-    rows.user_rows = caller_rows
     request.data.req.sampling_params.repetition_penalty = 1.2
     assert not runner.lookahead_eligible(batch)
     request.data.req.sampling_params.repetition_penalty = 1.0
@@ -642,6 +693,7 @@ def test_seed_cache_tracks_batch_members_and_reuses_device_tensor() -> None:
     runner = make_runner(FakeModel())
     first = make_request(3, params={"seed": 7}, request_id="first")
     second = make_request(3, params={"seed": 8}, request_id="second")
+    first.data.req.sampling_params.sampling_seed = (1 << 64) + 7
     tensors = []
     for requests in ([first], [first], [second], [second, first]):
         forward = SimpleNamespace(
@@ -660,6 +712,7 @@ def test_seed_cache_tracks_batch_members_and_reuses_device_tensor() -> None:
     assert tensors[3].tolist() == [int(tensors[2][0]), int(tensors[0][0])]
 
 
+@pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_resolve_cuda_copy_while_next_forward_is_slow() -> None:
     runner = make_runner(FakeModel())
