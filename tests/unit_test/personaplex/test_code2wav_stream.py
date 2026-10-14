@@ -482,3 +482,58 @@ def test_graph_replay_matches_eager_decode_across_slot_reuse(random_codec):
         for stream, slot in enumerate(pair):
             assert torch.equal(torch.cat(replayed[stream], -1), expected[stream])
             slots.release(slot)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("max_graph_frames", [0, 4], ids=["eager", "graph"])
+def test_codec_chunk_does_not_wait_for_unrelated_forward(
+    random_codec: MimiCodec, max_graph_frames: int
+) -> None:
+    codec = random_codec.cuda()
+    scheduler = PersonaPlexCode2WavScheduler(
+        MimiDecodeSlots(
+            codec, num_slots=1, max_graph_frames=max_graph_frames, max_chunk_frames=4
+        ),
+        compute_fn=lambda payload: payload,
+        chunk_ramp_frames=(1, 4),
+    )
+    codes = torch.randint(0, 2048, (6, 8), generator=torch.Generator().manual_seed(42))
+    expected = push_frames(scheduler, "warmup", codes)
+    expected.extend(
+        decode_waveform(message.data)
+        for message in scheduler.on_stream_done_before_payload("warmup")
+    )
+    scheduler.clear_stream_state("warmup")
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(500_000_000)  # noqa: leading-underscore
+    unrelated_done = torch.cuda.Event()
+    unrelated_done.record()
+    try:
+        actual = push_frames(scheduler, "reply", codes)
+        actual.extend(
+            decode_waveform(message.data)
+            for message in scheduler.on_stream_done_before_payload("reply")
+        )
+        assert not unrelated_done.query()
+        assert torch.equal(torch.cat(actual), torch.cat(expected))
+        scheduler.clear_stream_state("reply")
+        reused = push_frames(scheduler, "reused", codes[:1])
+        assert torch.equal(reused[0], expected[0])
+    finally:
+        unrelated_done.synchronize()
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_codec_stream_accepts_codes_from_the_current_cuda_stream(
+    random_codec: MimiCodec,
+) -> None:
+    scheduler = new_scheduler(random_codec.cuda(), (1, 4))
+    codes = torch.randint(0, 2048, (5, 8), generator=torch.Generator().manual_seed(43))
+    expected = push_frames(scheduler, "cpu", codes)
+    scheduler.clear_stream_state("cpu")
+    actual = push_frames(scheduler, "cuda", codes.cuda())
+    assert torch.equal(torch.cat(actual), torch.cat(expected))
+    scheduler.clear_stream_state("cuda")

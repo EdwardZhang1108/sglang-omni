@@ -10,6 +10,7 @@ amortizing per-decode launch and PCM transfer overhead.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -65,9 +66,24 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     ) -> None:
         super().__init__(compute_fn)
         self.decode_slots = decode_slots
+        self.decode_stream: torch.cuda.Stream | None = None
+        if decode_slots.codec.device.type == "cuda":
+            self.decode_stream = torch.cuda.Stream(device=decode_slots.codec.device)
+            # Note (edwardzh): Fence initialization once; later LM launches must not delay audio.
+            self.decode_stream.wait_stream(
+                torch.cuda.current_stream(decode_slots.codec.device)
+            )
+        else:
+            pass
         self.stream_states: dict[str, StreamState] = {}
         self.chunk_ramp_frames: tuple[int, ...] = tuple(chunk_ramp_frames)
         assert max(self.chunk_ramp_frames) <= decode_slots.max_chunk_frames
+
+    def decode_context(self) -> AbstractContextManager[None]:
+        if self.decode_stream is None:
+            return nullcontext()
+        else:
+            return torch.cuda.stream(self.decode_stream)
 
     def chunk_target_frames(self, state: StreamState) -> int:
         """Frames the next decode should cover; the last ramp entry is the steady width."""
@@ -84,7 +100,8 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     def stream_state(self, request_id: str) -> StreamState:
         state = self.stream_states.get(request_id)
         if state is None:
-            state = StreamState(decode_slot=self.decode_slots.acquire())
+            with self.decode_context():
+                state = StreamState(decode_slot=self.decode_slots.acquire())
             self.stream_states[request_id] = state
         else:
             pass
@@ -135,9 +152,16 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         )
         state.pending_frames -= frame_count
         state.decodes_done += 1
-        codes_BKF = codes_FK.T[None].to(self.decode_slots.codec.device)
-        waveform = self.decode_slots.decode_step(codes_BKF, state.decode_slot)[0, 0]
-        waveform = waveform.float().cpu()
+        if self.decode_stream is not None and codes_FK.is_cuda:
+            self.decode_stream.wait_stream(torch.cuda.current_stream(codes_FK.device))
+        else:
+            pass
+        # Note (edwardzh): The codec worker waits only for its own copies and decode,
+        # not the LM's next forward queued concurrently on the default stream.
+        with self.decode_context():
+            codes_BKF = codes_FK.T[None].to(self.decode_slots.codec.device)
+            waveform = self.decode_slots.decode_step(codes_BKF, state.decode_slot)[0, 0]
+            waveform = waveform.float().cpu()
         if state.num_samples:
             waveform = waveform[
                 ..., : max(state.num_samples - state.emitted_samples, 0)
