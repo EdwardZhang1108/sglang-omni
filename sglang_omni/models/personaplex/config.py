@@ -22,7 +22,7 @@ CODE2WAV_STAGE = "code2wav"
 
 
 class PersonaPlexLMFactoryArgs(FactoryArgs):
-    enable_async_decode: bool = True
+    enable_async_decode: bool = False
 
 
 class PersonaPlexLMStageConfig(EngineStageConfig):

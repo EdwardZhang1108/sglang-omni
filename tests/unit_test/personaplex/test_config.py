@@ -79,11 +79,11 @@ def test_personaplex_chunk_ramp_rejects_invalid_user_configuration(
             ConfigResolver(config).resolve(patches)
 
 
-def test_async_decode_can_be_disabled_from_cli() -> None:
+def test_async_decode_is_opt_in_from_cli() -> None:
     config = PersonaPlexPipelineConfig(model_path="model")
-    assert config.stage_named("lm").factory.enable_async_decode
+    assert not config.stage_named("lm").factory.enable_async_decode
     manager = ConfigManager(config)
     updated = manager.merge_config(
-        manager.parse_extra_args(["--lm.factory.enable_async_decode", "false"])
+        manager.parse_extra_args(["--lm.factory.enable_async_decode", "true"])
     )
-    assert not updated.stage_named("lm").factory.enable_async_decode
+    assert updated.stage_named("lm").factory.enable_async_decode
