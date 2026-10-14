@@ -42,8 +42,12 @@ class FakeDepformer:
 
     def generate(self, text_token_B, transformer_out_BD, forced_BK, sample):
         base = 1000 * (1 + len(self.calls))
-        rows = 100 * torch.arange(forced_BK.shape[0])[:, None]
-        codes = torch.where(forced_BK >= 0, forced_BK, base + rows + torch.arange(8))
+        rows = 100 * torch.arange(forced_BK.shape[0], device=forced_BK.device)[:, None]
+        codes = torch.where(
+            forced_BK >= 0,
+            forced_BK,
+            base + rows + torch.arange(8, device=forced_BK.device),
+        )
         self.calls.append(
             SimpleNamespace(
                 text=text_token_B.clone(),
@@ -198,7 +202,9 @@ def run_prefill(runner, requests, text_token_ids) -> None:
         requests,
     )
     runner.post_prefill(
-        SimpleNamespace(next_token_ids=torch.tensor(text_token_ids)),
+        SimpleNamespace(
+            next_token_ids=torch.tensor(text_token_ids, device=runner.model_device)
+        ),
         None,
         None,
         requests,
@@ -435,6 +441,10 @@ class DeferredHostRows:
         self.source: torch.Tensor | None = None
         self.ready = False
 
+    def __getitem__(self, rows: slice) -> "DeferredHostRows":
+        assert rows == slice(None, 1)
+        return self
+
     def copy_(self, source: torch.Tensor, *, non_blocking: bool) -> None:
         assert non_blocking
         self.source = source
@@ -485,6 +495,69 @@ def test_resolve_waits_for_its_copy_and_does_not_wait_for_next_step() -> None:
     assert torch.equal(frames[-1], first_frame)
     runner.execute_resolve(second)
     assert len(frames) == 3
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("batch_sizes", [(3, 2, 1), (3, 1)])
+def test_async_decode_with_shrinking_batch(
+    device: str, batch_sizes: tuple[int, ...]
+) -> None:
+    model = FakeModel(max_batch=3)
+    model.fusion_buffer = model.fusion_buffer.to(device)
+    model.hidden_out = model.hidden_out.to(device)
+    runner = make_runner(model)
+    runner.host_staging_buffers = [
+        torch.empty((3, 9), dtype=torch.long, pin_memory=device == "cuda")
+        for _ in range(2)
+    ]
+    runner.staging_slot = 0
+    requests = [make_request(5, request_id=f"r{index}") for index in range(3)]
+    run_prefill(runner, requests, [70, 71, 72])
+
+    for step, batch_size in enumerate(batch_sizes):
+        active_requests = requests[:batch_size][::-1]
+        previous_rows = [
+            runner.rows_on_device(request.data).agent_row.clone()
+            for request in active_requests
+        ]
+        tokens = torch.arange(batch_size, device=device) + 80 + 10 * step
+        result = SimpleNamespace(next_token_ids=tokens, can_run_cuda_graph=True)
+        frames = runner.post_decode_launch(result, None, active_requests)
+        if device == "cuda":
+            completed = torch.cuda.Event()
+            completed.record()
+        else:
+            completed = SimpleNamespace(query=lambda: True)
+        batch = SimpleNamespace(reqs=[request.data.req for request in active_requests])
+        output = runner.execute_resolve(
+            PendingStep(
+                event=completed,
+                launch_buf=frames,
+                forward_batch=None,
+                schedule_batch=batch,
+                batch_result=result,
+                scheduler_output=SchedulerOutput(
+                    requests=active_requests, batch_data=batch
+                ),
+            )
+        )
+        assert output.host_token_ids.tolist() == tokens.tolist()
+        for index, request in enumerate(active_requests):
+            expected = output_frame(previous_rows[index], frames.agent_rows[index])
+            assert torch.equal(
+                request.data.talker_model_inputs["frames"][-1], expected.cpu()
+            )
 
 
 def test_retract_discards_uncommitted_audio_draw_and_replays_it() -> None:

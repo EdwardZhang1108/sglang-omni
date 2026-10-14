@@ -262,7 +262,9 @@ class PersonaPlexModelRunner(ModelRunner):
             )
         packed_rows = torch.cat((text_tokens[:, None], torch.stack(frames)), dim=1)
         if non_blocking:
-            host_rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)
+            host_rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)[
+                :batch_size
+            ]
             host_rows.copy_(packed_rows, non_blocking=True)
         else:
             host_rows = packed_rows.cpu()
