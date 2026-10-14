@@ -68,23 +68,18 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 |---|---|
 | `voice` | A packaged voice name (`NATF0..3`, `NATM0..3`, `VARF0..4`, `VARM0..4`), a `.pt` file, or a recording. Default `NATF2`; an empty string runs without a voice prompt. |
 | `text_prompt` (or `instructions`) | The role prompt, wrapped in `<system>` tags. Default: the reference assistant prompt. |
-| `temperature`, `top_k` | Text sampling; defaults 0.7 / 25, which the client's filler values (1.0 / -1) do not override unless set explicitly. `temperature=0` is greedy. |
+| `temperature`, `top_k` | Text sampling, defaults 0.7 / 25. `temperature=0` is greedy. |
 | `audio_temperature`, `audio_top_k` | Code sampling in the depformer; defaults 0.8 / 250. |
 | `seed` | Makes both draws reproducible (a child seed each for text and audio). |
 | `max_new_tokens` | Ignored; the frame count is fixed by the input length. |
 
-### Explicit stage sampling
+### Stage sampling
 
-HTTP chat and rollout requests preserve which fields were provided in
-`stage_sampling.lm`. For example, `{"seed": 7}` keeps the PersonaPlex text
-defaults (temperature 0.7, top-k 25), while
-`{"temperature": 1.0, "top_k": -1}` explicitly selects temperature 1.0 and
-disables top-k filtering. In-process stage `SamplingParams` objects are complete configurations:
-all serialized fields are explicit. Thus `SamplingParams(seed=7)` in
-`stage_sampling.lm` selects temperature 1.0 and top-k -1 as well as seed 7.
-To keep PersonaPlex text defaults, omit `stage_sampling` and set the seed in
-the top-level `sampling=SamplingParams(seed=7)` instead. Top-level client
-filler handling is unchanged.
+Fields left out of `stage_sampling.lm` keep the PersonaPlex text defaults.
+For example, `{"seed": 7}` keeps temperature 0.7 and top-k 25, while
+`{"temperature": 1.0, "top_k": -1}` samples at temperature 1.0 with no top-k
+filtering. The same holds for `SamplingParams` objects passed to the Python
+client: `SamplingParams(seed=7)` in `stage_sampling.lm` sets only the seed.
 
 Text sampling uses `stage_sampling.lm`, then `stage_params.lm`, then top-level
 request values. Stage sampling also takes precedence for `seed`.
