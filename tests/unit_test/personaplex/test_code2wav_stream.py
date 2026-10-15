@@ -526,15 +526,13 @@ def test_codec_chunk_does_not_wait_for_unrelated_forward(
         unrelated_done.synchronize()
 
 
-@pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_codec_rejects_cuda_codes_before_acquiring_a_slot(
+def test_codec_rejects_non_cpu_codes_before_acquiring_a_slot(
     random_codec: MimiCodec, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scheduler = new_scheduler(random_codec)
     acquire = Mock(wraps=scheduler.decode_slots.acquire)
     monkeypatch.setattr(scheduler.decode_slots, "acquire", acquire)
-    codes = torch.zeros((1, 8), dtype=torch.long, device="cuda")
+    codes = torch.zeros((1, 8), dtype=torch.long, device="meta")
     with pytest.raises(AssertionError, match="stream codes must be on CPU"):
         push_frames(scheduler, "reply", codes)
     acquire.assert_not_called()

@@ -93,9 +93,9 @@ class PersonaPlexModelRunner(ModelRunner):
         for request in batch.reqs:
             data = request.omni_data
             timeline = self.request_timeline(data)
-            rows = self.decode_feedback(data)
-            # Note (edwardzh): The last caller row still exists after the output budget is exhausted.
-            if data.return_logprob or rows.launched_frames >= timeline.num_frames:
+            feedback = self.decode_feedback(data)
+            # Note (edwardzh): An over-budget launch would be discarded after its forward.
+            if data.return_logprob or feedback.launched_frames >= timeline.num_frames:
                 return False
             else:
                 pass
