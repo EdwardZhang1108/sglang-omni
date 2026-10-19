@@ -66,9 +66,6 @@ class SamplingRun:
 
 
 class PersonaPlexModelRunner(ModelRunner):
-    sampling_seed_key: tuple[tuple[str, int | None], ...] = ()
-    sampling_seed_tensor: torch.Tensor | None = None
-
     def sample_before_post_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -100,35 +97,6 @@ class PersonaPlexModelRunner(ModelRunner):
             else:
                 pass
         return True
-
-    def install_sampling_seeds(
-        self, forward_batch: ForwardBatch, requests: list[SchedulerRequest]
-    ) -> None:
-        sampling_info = forward_batch.sampling_info
-        if sampling_info.sampling_seed is not None:
-            self.validate_seeded_sampling_supported(sampling_info)
-            return
-        else:
-            pass
-        seed_key = tuple(
-            (request.request_id, request.data.req.sampling_params.sampling_seed)
-            for request in requests
-        )
-        if seed_key == self.sampling_seed_key:
-            sampling_info.sampling_seed = self.sampling_seed_tensor
-            if self.sampling_seed_tensor is not None:
-                self.validate_seeded_sampling_supported(sampling_info)
-            else:
-                pass
-        else:
-            # Note (edwardzh): A pageable seed upload after forward waits for the backbone.
-            super().install_sampling_seeds(forward_batch, requests)
-            # Note (edwardzh): The base hook may normalize seeds, so cache the updated key.
-            self.sampling_seed_key = tuple(
-                (request.request_id, request.data.req.sampling_params.sampling_seed)
-                for request in requests
-            )
-            self.sampling_seed_tensor = sampling_info.sampling_seed
 
     @property
     def model_device(self) -> torch.device:
@@ -228,7 +196,7 @@ class PersonaPlexModelRunner(ModelRunner):
     ) -> PersonaPlexFrameBatch:
         """Prepare frame results for the positions just predicted.
 
-        Row i of text_token_B, forced_BK and hidden_out belongs to requests[i].
+        Row i of text_token_B and forced_BK belongs to requests[i].
         """
         batch_size = len(requests)
         codes_BK = self.model.depformer.generate(
@@ -258,6 +226,7 @@ class PersonaPlexModelRunner(ModelRunner):
             )
         packed_rows = torch.cat((text_tokens[:, None], torch.stack(frames)), dim=1)
         if non_blocking:
+            # Note (edwardzh): Reused staging can be larger than a shrinking batch.
             host_rows = self.next_host_staging(packed_rows.shape, packed_rows.dtype)[
                 :batch_size
             ]

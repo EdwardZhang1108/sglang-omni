@@ -142,13 +142,13 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
             ),
             key=lambda state: state.ready_order,
         )
-        for state in waiting:
-            with self.decode_context():
+        with self.decode_context():
+            for state in waiting:
                 state.slot_index = self.decode_slots.acquire()
-            if state.slot_index is None:
-                break
-            else:
-                pass
+                if state.slot_index is None:
+                    break
+                else:
+                    pass
 
     def release_decode_slot(self, state: StreamState) -> None:
         if state.slot_index is not None:

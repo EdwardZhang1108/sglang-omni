@@ -30,6 +30,8 @@ from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputP
 from sglang_omni.scheduling.types import SchedulerOutput
 
 VOICE_FRAMES = 4
+# Note (edwardzh): Leave generous host scheduling margin for the single-resolve check.
+SLOW_FORWARD_CYCLES = 2_000_000_000
 
 
 class FakeDepformer:
@@ -689,29 +691,6 @@ def test_lookahead_requires_budget_and_history_free_sampling(
     assert not runner.lookahead_eligible(batch)
 
 
-def test_seed_cache_tracks_batch_members_and_reuses_device_tensor() -> None:
-    runner = make_runner(FakeModel())
-    first = make_request(3, params={"seed": 7}, request_id="first")
-    second = make_request(3, params={"seed": 8}, request_id="second")
-    first.data.req.sampling_params.sampling_seed = (1 << 64) + 7
-    tensors = []
-    for requests in ([first], [first], [second], [second, first]):
-        forward = SimpleNamespace(
-            sampling_info=SimpleNamespace(
-                sampling_seed=None,
-                device="cpu",
-                need_min_p_sampling=False,
-                need_top_p_sampling=False,
-                need_top_k_sampling=False,
-            )
-        )
-        runner.install_sampling_seeds(forward, requests)
-        tensors.append(forward.sampling_info.sampling_seed)
-    assert tensors[0] is tensors[1]
-    assert tensors[2] is not tensors[1]
-    assert tensors[3].tolist() == [int(tensors[2][0]), int(tensors[0][0])]
-
-
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_resolve_cuda_copy_while_next_forward_is_slow() -> None:
@@ -738,7 +717,7 @@ def test_resolve_cuda_copy_while_next_forward_is_slow() -> None:
         ),
         scheduler_output=SchedulerOutput(requests=[request], batch_data=batch),
     )
-    torch.cuda._sleep(500_000_000)  # noqa: leading-underscore
+    torch.cuda._sleep(SLOW_FORWARD_CYCLES)  # noqa: leading-underscore
     next_completed = torch.cuda.Event()
     next_completed.record()
     try:
