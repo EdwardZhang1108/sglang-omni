@@ -10,12 +10,15 @@ back.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Iterator
+from pathlib import Path
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import QuantParamSchema
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import add_prefix
@@ -99,6 +102,104 @@ class PersonaPlexForCausalLM(nn.Module):
         # note (LinzeShi): The full ring masks its oldest slot; the left window
         # excludes the current key, leaving context - 1 visible keys in total.
         return self.temporal.context - 2
+
+    @torch.no_grad()
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        """Load validated FP8 KV scales before attention graphs are captured."""
+        backbone = self.llm.model
+        tp_rank, tp_size = (
+            backbone._kv_cache_parallel_layout
+        )  # Note (edwardzh): Use Llama's stored KV shard layout; noqa: leading-underscore
+        num_layers = backbone.config.num_hidden_layers
+        schema = QuantParamSchema.model_validate_json(
+            Path(quantization_param_path).read_text(),
+            strict=True,
+            context={
+                "model_type": backbone.config.__class__.model_type,
+                "num_hidden_layers": num_layers,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            },
+        )
+        rank_scales = schema.kv_cache.scaling_factor
+        if set(rank_scales) != set(range(tp_size)):
+            raise ValueError(f"KV scale ranks must be exactly 0 through {tp_size - 1}")
+        else:
+            pass
+        rounded_scales: dict[int, dict[int, float]] = {}
+        for rank, layer_scales in rank_scales.items():
+            if set(layer_scales) != set(range(num_layers)):
+                raise ValueError(
+                    f"KV scale layers for rank {rank} must be exactly 0 through {num_layers - 1}"
+                )
+            else:
+                pass
+            rounded_scales[rank] = {}
+            for layer_index, scale in layer_scales.items():
+                if not math.isfinite(scale) or scale <= 0:
+                    raise ValueError(
+                        f"KV scale for rank {rank}, layer {layer_index} must be finite and positive"
+                    )
+                else:
+                    pass
+                rounded_scale = torch.tensor(
+                    scale, dtype=torch.float32, device="cpu"
+                ).item()
+                if not math.isfinite(rounded_scale) or rounded_scale <= 0:
+                    raise ValueError(
+                        f"KV scale for rank {rank}, layer {layer_index} must remain finite and positive in float32"
+                    )
+                else:
+                    pass
+                rounded_scales[rank][layer_index] = rounded_scale
+
+        # Note (edwardzh): Validate every layer before changing scales, so a rejected file cannot leave a partially calibrated model.
+        updates: list[
+            tuple[nn.Module, str, torch.Tensor | None, torch.Tensor, float]
+        ] = []
+        for layer_index, layer in enumerate(backbone.layers):
+            attention = layer.self_attn.attn
+            device = layer.self_attn.qkv_proj.weight.device
+            rounded_scale = rounded_scales[tp_rank][layer_index]
+            for scale_name in ("k_scale", "v_scale"):
+                current_scale = getattr(attention, scale_name)
+                if current_scale is not None and (
+                    not isinstance(current_scale, torch.Tensor)
+                    or current_scale.ndim != 0
+                    or current_scale.dtype != torch.float32
+                    or current_scale.device != device
+                ):
+                    raise ValueError(
+                        f"Layer {layer_index} {scale_name} must be a scalar float32 tensor on {device} or None"
+                    )
+                else:
+                    pass
+                prepared_scale = torch.tensor(
+                    rounded_scale, dtype=torch.float32, device=device
+                )
+                updates.append(
+                    (
+                        attention,
+                        scale_name,
+                        current_scale,
+                        prepared_scale,
+                        rounded_scale,
+                    )
+                )
+
+        for (
+            attention,
+            scale_name,
+            current_scale,
+            prepared_scale,
+            rounded_scale,
+        ) in updates:
+            if current_scale is None:
+                setattr(attention, scale_name, prepared_scale)
+            else:
+                current_scale.copy_(prepared_scale)
+            # Note (edwardzh): Attention backends consume both tensor and host scalar scales; they must agree after float32 rounding.
+            setattr(attention, f"{scale_name}_float", rounded_scale)
 
     def embed_rows(self, rows_NK: torch.Tensor) -> torch.Tensor:
         """Sum the 17 stream embeddings of each row, in the reference's order
