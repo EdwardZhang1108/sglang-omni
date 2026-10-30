@@ -28,7 +28,7 @@ DIM = 4
 
 
 def kv_scale_model(
-    scale_state: Literal["missing", "parameter", "tensor"], *, tp_rank: int = 0
+    scale_state: Literal["missing", "parameter", "tensor"]
 ) -> SimpleNamespace:
     layers = nn.ModuleList()
     for _ in range(2):
@@ -51,9 +51,10 @@ def kv_scale_model(
             model=SimpleNamespace(
                 config=LlamaConfig(num_hidden_layers=len(layers)),
                 layers=layers,
-                _kv_cache_parallel_layout=(tp_rank, 2),
+                _kv_cache_parallel_layout=(0, 1),
             )
-        )
+        ),
+        fusion_buffer=torch.empty(1, DIM),
     )
 
 
@@ -80,13 +81,12 @@ def write_kv_scales(
     ["missing", "parameter", "tensor"],
     ids=["bf16-weights", "fp8-weights", "existing-tensor"],
 )
-@pytest.mark.parametrize("tp_rank", [0, 1])
 def test_kv_scales_support_attention_tensor_and_host_scalar_consumers(
-    tmp_path: Path, scale_state: Literal["missing", "parameter", "tensor"], tp_rank: int
+    tmp_path: Path, scale_state: Literal["missing", "parameter", "tensor"]
 ) -> None:
     """Non-unit scales must reach both attention APIs without replacing loaded Parameters."""
-    model = kv_scale_model(scale_state, tp_rank=tp_rank)
-    scales = {0: {0: 0.1, 1: 0.2}, 1: {0: 0.3, 1: 0.4}}
+    model = kv_scale_model(scale_state)
+    scales = {0: {0: 0.1, 1: 0.2}}
     original_scales = [
         [
             (scale, scale.data_ptr() if scale is not None else None)
@@ -98,11 +98,11 @@ def test_kv_scales_support_attention_tensor_and_host_scalar_consumers(
         model, write_kv_scales(tmp_path / "scales.json", scales)
     )
     for layer_index, layer in enumerate(model.llm.model.layers):
-        expected = torch.tensor(scales[tp_rank][layer_index], dtype=torch.float32)
+        expected = torch.tensor(scales[0][layer_index], dtype=torch.float32)
         for scale_index, scale_name in enumerate(("k_scale", "v_scale")):
             scale = getattr(layer.self_attn.attn, scale_name)
             assert scale.dtype == torch.float32
-            assert scale.device == layer.self_attn.qkv_proj.weight.device
+            assert scale.device == model.fusion_buffer.device
             assert torch.equal(scale.expand(2, 3), expected.expand(2, 3))
             assert getattr(layer.self_attn.attn, f"{scale_name}_float") == scale.item()
             original, original_address = original_scales[layer_index][scale_index]
@@ -132,15 +132,13 @@ def test_invalid_last_kv_scale_preserves_every_layer(
     scale_state: Literal["missing", "parameter"],
     invalid_scale: float,
 ) -> None:
-    """A bad scale on another TP rank must not leave the current rank partly calibrated."""
+    """A bad final scale must not leave earlier layers partly calibrated."""
     model = kv_scale_model(scale_state)
     original_scales = [
         (layer.self_attn.attn.k_scale, layer.self_attn.attn.v_scale)
         for layer in model.llm.model.layers
     ]
-    path = write_kv_scales(
-        tmp_path / "scales.json", {0: {0: 0.1, 1: 0.2}, 1: {0: 0.3, 1: invalid_scale}}
-    )
+    path = write_kv_scales(tmp_path / "scales.json", {0: {0: 0.1, 1: invalid_scale}})
     with pytest.raises(ValueError, match="finite and positive"):
         PersonaPlexForCausalLM.load_kv_cache_scales(model, path)
     for layer_index, layer in enumerate(model.llm.model.layers):
@@ -155,33 +153,33 @@ def test_invalid_last_kv_scale_preserves_every_layer(
 
 
 @pytest.mark.parametrize(
-    "invalid_case",
+    "invalid_case,error_type,message",
     [
-        "missing-file",
-        "invalid-json",
-        "model",
-        "dtype",
-        "rank",
-        "layer",
-        "extra-rank",
-        "extra-layer",
+        ("missing-file", FileNotFoundError, "scales.json"),
+        ("invalid-json", ValueError, "Invalid JSON"),
+        ("model", ValueError, "Model type is llama"),
+        ("dtype", ValueError, "rather than float8_e4m3fn"),
+        ("rank", ValueError, "TP rank 0 not found"),
+        ("layer", ValueError, "scales for layer 1"),
+        ("extra-rank", ValueError, "Loaded dictionary has TP size 2"),
+        ("extra-layer", ValueError, "Expected 2 layers, got 3"),
     ],
 )
 def test_kv_scale_file_errors_do_not_fall_back_to_unit_scales(
-    tmp_path: Path, invalid_case: str
+    tmp_path: Path, invalid_case: str, error_type: type[Exception], message: str
 ) -> None:
-    """An explicitly supplied invalid calibration must fail instead of serving with unit scales."""
+    """An invalid calibration must fail for the expected reason before any update."""
     model = kv_scale_model("missing")
-    scales = {0: {0: 0.1, 1: 0.2}, 1: {0: 0.3, 1: 0.4}}
+    scales = {0: {0: 0.1, 1: 0.2}}
     path = tmp_path / "scales.json"
     if invalid_case == "rank":
-        scales[2] = scales.pop(1)
+        scales[1] = scales.pop(0)
     elif invalid_case == "layer":
-        scales[1][2] = scales[1].pop(1)
+        scales[0][2] = scales[0].pop(1)
     elif invalid_case == "extra-rank":
-        scales[2] = {0: 0.5, 1: 0.6}
+        scales[1] = {0: 0.5, 1: 0.6}
     elif invalid_case == "extra-layer":
-        scales[1][2] = 0.5
+        scales[0][2] = 0.5
     else:
         pass
     write_kv_scales(
@@ -196,7 +194,7 @@ def test_kv_scale_file_errors_do_not_fall_back_to_unit_scales(
         path.write_text("{")
     else:
         pass
-    with pytest.raises((ValueError, FileNotFoundError)):
+    with pytest.raises(error_type, match=message):
         PersonaPlexForCausalLM.load_kv_cache_scales(model, str(path))
     assert all(
         layer.self_attn.attn.k_scale is None and layer.self_attn.attn.v_scale is None
@@ -224,15 +222,75 @@ def test_invalid_last_kv_scale_target_preserves_existing_parameters(
     with pytest.raises(ValueError, match="scalar float32 tensor"):
         PersonaPlexForCausalLM.load_kv_cache_scales(
             model,
-            write_kv_scales(
-                tmp_path / "scales.json", {0: {0: 0.1, 1: 0.2}, 1: {0: 0.3, 1: 0.4}}
-            ),
+            write_kv_scales(tmp_path / "scales.json", {0: {0: 0.1, 1: 0.2}}),
         )
     assert first_attention.k_scale is first_key_scale
     for layer in model.llm.model.layers:
         assert layer.self_attn.attn.k_scale.item() == 1.0
         assert layer.self_attn.attn.k_scale_float == 1.0
         assert layer.self_attn.attn.v_scale_float == 1.0
+
+
+@pytest.mark.parametrize("scale_state", ["missing", "parameter", "tensor"])
+def test_kv_scales_do_not_use_offloaded_projection_device(
+    tmp_path: Path, scale_state: str
+) -> None:
+    model = kv_scale_model(scale_state)
+    for layer in model.llm.model.layers:
+        layer.self_attn.qkv_proj.to("meta")
+    PersonaPlexForCausalLM.load_kv_cache_scales(
+        model, write_kv_scales(tmp_path / "scales.json", {0: {0: 0.3, 1: 0.4}})
+    )
+    for layer in model.llm.model.layers:
+        assert layer.self_attn.attn.k_scale.device == model.fusion_buffer.device
+        assert layer.self_attn.attn.k_scale.item() == layer.self_attn.attn.k_scale_float
+
+
+def test_kv_scales_preserve_offloaded_cpu_parameters(tmp_path: Path) -> None:
+    model = kv_scale_model("parameter")
+    model.fusion_buffer = torch.empty(1, DIM, device="meta")
+    original = model.llm.model.layers[0].self_attn.attn.k_scale
+    address = original.data_ptr()
+    PersonaPlexForCausalLM.load_kv_cache_scales(
+        model, write_kv_scales(tmp_path / "scales.json", {0: {0: 0.3, 1: 0.4}})
+    )
+    assert model.llm.model.layers[0].self_attn.attn.k_scale is original
+    assert original.data_ptr() == address
+    assert original.item() == torch.tensor(0.3, dtype=torch.float32).item()
+
+
+def test_missing_kv_scales_use_execution_device(tmp_path: Path) -> None:
+    model = kv_scale_model("missing")
+    model.fusion_buffer = torch.empty(1, DIM, device="meta")
+    PersonaPlexForCausalLM.load_kv_cache_scales(
+        model, write_kv_scales(tmp_path / "scales.json", {0: {0: 0.3, 1: 0.4}})
+    )
+    for layer in model.llm.model.layers:
+        assert layer.self_attn.attn.k_scale.device == model.fusion_buffer.device
+
+
+def test_plain_cpu_scale_cannot_follow_offloader(tmp_path: Path) -> None:
+    model = kv_scale_model("tensor")
+    model.fusion_buffer = torch.empty(1, DIM, device="meta")
+    with pytest.raises(ValueError, match="offloaded CPU Parameter"):
+        PersonaPlexForCausalLM.load_kv_cache_scales(
+            model, write_kv_scales(tmp_path / "scales.json", {0: {0: 0.3, 1: 0.4}})
+        )
+    assert model.llm.model.layers[0].self_attn.attn.k_scale.item() == 1.0
+
+
+def test_custom_kv_scales_reject_fnuz_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "sglang_omni.models.personaplex.sglang_model.is_fp8_fnuz", lambda: True
+    )
+    model = kv_scale_model("parameter")
+    with pytest.raises(NotImplementedError, match="do not support FP8 FNUZ"):
+        PersonaPlexForCausalLM.load_kv_cache_scales(
+            model, str(tmp_path / "missing.json")
+        )
+    assert model.llm.model.layers[0].self_attn.attn.k_scale.item() == 1.0
 
 
 def test_backbone_tensors_map_onto_llama_names():
